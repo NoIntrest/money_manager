@@ -336,6 +336,19 @@ Give practical, specific, actionable advice based on THEIR actual data. Be warm 
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 
+@app.route("/api/health")
+def health():
+    """Quick check — is the DB reachable?"""
+    db_url = os.environ.get("DATABASE_URL", "")
+    if not db_url:
+        return jsonify({"status": "error", "reason": "DATABASE_URL not set"}), 500
+    try:
+        conn = get_db()
+        conn.close()
+        return jsonify({"status": "ok", "db": "connected"})
+    except Exception as e:
+        return jsonify({"status": "error", "reason": str(e)}), 500
+
 @app.route("/")
 def index():
     return FRONTEND
@@ -1127,12 +1140,29 @@ async function submitAuth(){
   const password=document.getElementById('auth-password').value;
   const err=document.getElementById('auth-error');
   err.style.display='none';
-  const endpoint=authMode==='login'?'/api/login':'/api/signup';
-  const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
-  const data=await res.json();
-  if(!res.ok){err.textContent=data.error;err.style.display='block';return;}
-  userCurrency=data.currency||'USD';
-  showApp(data.email);
+  // Basic validation
+  if(!email){err.textContent='Please enter your email.';err.style.display='block';return;}
+  if(!password||password.length<6){err.textContent='Password must be at least 6 characters.';err.style.display='block';return;}
+  const btn=document.getElementById('auth-btn');
+  btn.textContent='Please wait...';btn.disabled=true;
+  try{
+    const endpoint=authMode==='login'?'/api/login':'/api/signup';
+    const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
+    let data;
+    try{ data=await res.json(); }
+    catch(e){ 
+      // Server returned non-JSON (e.g. 500 HTML error page)
+      err.textContent='Server error — the database may not be connected yet. Check Render environment variables (DATABASE_URL).';
+      err.style.display='block';return;
+    }
+    if(!res.ok){err.textContent=data.error||'Something went wrong.';err.style.display='block';return;}
+    userCurrency=data.currency||'USD';
+    showApp(data.email);
+  }catch(e){
+    err.textContent='Network error: '+e.message;err.style.display='block';
+  }finally{
+    btn.textContent=authMode==='login'?'Sign In →':'Create Account →';btn.disabled=false;
+  }
 }
 document.addEventListener('keydown',e=>{if(e.key==='Enter'&&document.getElementById('auth-screen').style.display!=='none')submitAuth();});
 async function logout(){
