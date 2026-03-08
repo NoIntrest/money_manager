@@ -1,66 +1,72 @@
 #!/usr/bin/env python3
 """
-💰 Vault — Money Manager (v2)
+💰 Vault — Money Manager (v3)
 Features: Multi-currency, Live rates, AI Budget Advisor
-Run: pip install flask requests && python money_app.py
+Database: PostgreSQL (persistent on Render)
+Run locally: pip install flask requests psycopg2-binary && python money_app.py
+On Render:  Set DATABASE_URL env var from your Render PostgreSQL instance
 Open: http://localhost:5000
 """
 
 from flask import Flask, request, jsonify, session
-import sqlite3, hashlib, os, json, requests as req
+import hashlib, os, json, requests as req
 from datetime import datetime, date
 from functools import wraps
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-prod")
-DB = "vault.db"
 
 # ─── Database ─────────────────────────────────────────────────────────────────
+# Reads DATABASE_URL from environment (set by Render automatically when you
+# attach a PostgreSQL instance). Falls back to a local SQLite-style URL if
+# you want to test locally with PostgreSQL too.
+
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
 def get_db():
-    db = sqlite3.connect(DB)
-    db.row_factory = sqlite3.Row
-    return db
+    """Return a new psycopg2 connection. Render injects DATABASE_URL."""
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL environment variable is not set. "
+            "Add a PostgreSQL database in Render and link it to this service."
+        )
+    # Render sometimes gives 'postgres://' but psycopg2 needs 'postgresql://'
+    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    conn = psycopg2.connect(url)
+    return conn
 
 def init_db():
-    db = get_db()
-    db.executescript("""
+    """Create tables if they don't exist. Safe to run on every startup."""
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
             password TEXT NOT NULL,
             currency TEXT DEFAULT 'USD',
             anthropic_key TEXT DEFAULT '',
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
             type TEXT NOT NULL,
-            amount REAL NOT NULL,
+            amount NUMERIC(14,2) NOT NULL,
             currency TEXT DEFAULT 'USD',
             category TEXT,
             note TEXT,
             date TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (user_id) REFERENCES users(id)
-        );
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
     """)
-    # migrate: add currency column if missing
-    try:
-        db.execute("ALTER TABLE users ADD COLUMN currency TEXT DEFAULT 'USD'")
-        db.commit()
-    except: pass
-    try:
-        db.execute("ALTER TABLE users ADD COLUMN anthropic_key TEXT DEFAULT ''")
-        db.commit()
-    except: pass
-    try:
-        db.execute("ALTER TABLE transactions ADD COLUMN currency TEXT DEFAULT 'USD'")
-        db.commit()
-    except: pass
-    db.commit()
-    db.close()
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
@@ -84,27 +90,36 @@ def signup():
         return jsonify({"error": "Email and password required"}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
-    db = get_db()
+    conn = get_db()
     try:
-        db.execute("INSERT INTO users (email, password) VALUES (?, ?)", (email, hash_pw(password)))
-        db.commit()
-        user = db.execute("SELECT * FROM users WHERE email=?", (email,)).fetchone()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("INSERT INTO users (email, password) VALUES (%s, %s)", (email, hash_pw(password)))
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+        user = cur.fetchone()
         session["user_id"] = user["id"]
         session["email"] = email
+        cur.close(); conn.close()
         return jsonify({"success": True, "email": email, "currency": "USD"})
-    except sqlite3.IntegrityError:
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        conn.close()
         return jsonify({"error": "Email already registered"}), 409
-    finally:
-        db.close()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/api/login", methods=["POST"])
 def login():
     data = request.json
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    db = get_db()
-    user = db.execute("SELECT * FROM users WHERE email=? AND password=?", (email, hash_pw(password))).fetchone()
-    db.close()
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE email=%s AND password=%s", (email, hash_pw(password)))
+    user = cur.fetchone()
+    cur.close(); conn.close()
     if not user:
         return jsonify({"error": "Invalid email or password"}), 401
     session["user_id"] = user["id"]
@@ -120,9 +135,11 @@ def logout():
 def me():
     if "user_id" not in session:
         return jsonify({"logged_in": False})
-    db = get_db()
-    user = db.execute("SELECT email, currency, anthropic_key FROM users WHERE id=?", (session["user_id"],)).fetchone()
-    db.close()
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT email, currency, anthropic_key FROM users WHERE id=%s", (session["user_id"],))
+    user = cur.fetchone()
+    cur.close(); conn.close()
     has_key = bool(user["anthropic_key"]) if user else False
     return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key})
 
@@ -132,20 +149,20 @@ def me():
 @login_required
 def update_settings():
     data = request.json
-    db = get_db()
-    # FIX Bug 1&6: only update fields that were actually sent — never wipe a
-    # field because it was absent from this particular request
+    conn = get_db()
+    cur = conn.cursor()
+    # Only update fields that were actually sent — never wipe a field
     if "currency" in data and "anthropic_key" in data:
-        db.execute("UPDATE users SET currency=?, anthropic_key=? WHERE id=?",
+        cur.execute("UPDATE users SET currency=%s, anthropic_key=%s WHERE id=%s",
                    (data["currency"], data["anthropic_key"], session["user_id"]))
     elif "currency" in data:
-        db.execute("UPDATE users SET currency=? WHERE id=?",
+        cur.execute("UPDATE users SET currency=%s WHERE id=%s",
                    (data["currency"], session["user_id"]))
     elif "anthropic_key" in data:
-        db.execute("UPDATE users SET anthropic_key=? WHERE id=?",
+        cur.execute("UPDATE users SET anthropic_key=%s WHERE id=%s",
                    (data["anthropic_key"], session["user_id"]))
-    db.commit()
-    db.close()
+    conn.commit()
+    cur.close(); conn.close()
     return jsonify({"success": True})
 
 # ─── Live Currency Rates ───────────────────────────────────────────────────────
@@ -179,12 +196,14 @@ def get_rates():
 @login_required
 def get_transactions():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
-    db = get_db()
-    rows = db.execute(
-        "SELECT * FROM transactions WHERE user_id=? AND date LIKE ? ORDER BY date DESC, id DESC",
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT * FROM transactions WHERE user_id=%s AND date LIKE %s ORDER BY date DESC, id DESC",
         (session["user_id"], f"{month}%")
-    ).fetchall()
-    db.close()
+    )
+    rows = cur.fetchall()
+    cur.close(); conn.close()
     return jsonify([dict(r) for r in rows])
 
 @app.route("/api/transactions", methods=["POST"])
@@ -204,34 +223,38 @@ def add_transaction():
         if amount <= 0: raise ValueError()
     except (TypeError, ValueError):
         return jsonify({"error": "Amount must be a positive number"}), 400
-    db = get_db()
-    db.execute(
-        "INSERT INTO transactions (user_id, type, amount, currency, category, note, date) VALUES (?,?,?,?,?,?,?)",
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO transactions (user_id, type, amount, currency, category, note, date) VALUES (%s,%s,%s,%s,%s,%s,%s)",
         (session["user_id"], tx_type, amount, currency, category, note, tx_date)
     )
-    db.commit()
-    db.close()
+    conn.commit()
+    cur.close(); conn.close()
     return jsonify({"success": True})
 
 @app.route("/api/transactions/<int:tx_id>", methods=["DELETE"])
 @login_required
 def delete_transaction(tx_id):
-    db = get_db()
-    db.execute("DELETE FROM transactions WHERE id=? AND user_id=?", (tx_id, session["user_id"]))
-    db.commit()
-    db.close()
+    conn = get_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tx_id, session["user_id"]))
+    conn.commit()
+    cur.close(); conn.close()
     return jsonify({"success": True})
 
 @app.route("/api/summary")
 @login_required
 def summary():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
-    db = get_db()
-    rows = db.execute(
-        "SELECT type, category, amount FROM transactions WHERE user_id=? AND date LIKE ?",
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute(
+        "SELECT type, category, amount FROM transactions WHERE user_id=%s AND date LIKE %s",
         (session["user_id"], f"{month}%")
-    ).fetchall()
-    db.close()
+    )
+    rows = cur.fetchall()
+    cur.close(); conn.close()
     income = sum(r["amount"] for r in rows if r["type"] == "income")
     expenses = sum(r["amount"] for r in rows if r["type"] == "expense")
     cats = {}
@@ -250,16 +273,17 @@ def ai_chat():
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
-    # Get user's Anthropic key
-    db = get_db()
-    user = db.execute("SELECT anthropic_key, currency FROM users WHERE id=?", (session["user_id"],)).fetchone()
-
-    # Get recent transactions for context
-    txs = db.execute(
-        "SELECT type, amount, category, note, date FROM transactions WHERE user_id=? ORDER BY date DESC LIMIT 50",
+    # Get user's Anthropic key + recent transactions for context
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT anthropic_key, currency FROM users WHERE id=%s", (session["user_id"],))
+    user = cur.fetchone()
+    cur.execute(
+        "SELECT type, amount, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
         (session["user_id"],)
-    ).fetchall()
-    db.close()
+    )
+    txs = cur.fetchall()
+    cur.close(); conn.close()
 
     api_key = user["anthropic_key"] if user else ""
     currency = user["currency"] if user else "USD"
@@ -1460,6 +1484,7 @@ if __name__ == "__main__":
     print("═" * 44)
     print("  Open:  http://localhost:5000")
     print("  Stop:  Ctrl+C")
+    print("  DB:    PostgreSQL (persistent)")
     print("  New:   Multi-currency + AI Advisor")
     print("═" * 44 + "\n")
     app.run(debug=True, port=5000)
