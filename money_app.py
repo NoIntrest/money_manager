@@ -204,7 +204,12 @@ def get_transactions():
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return jsonify([dict(r) for r in rows])
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["amount"] = float(d["amount"])
+        result.append(d)
+    return jsonify(result)
 
 @app.route("/api/transactions", methods=["POST"])
 @login_required
@@ -255,13 +260,13 @@ def summary():
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    income = sum(r["amount"] for r in rows if r["type"] == "income")
-    expenses = sum(r["amount"] for r in rows if r["type"] == "expense")
+    income = float(sum(r["amount"] for r in rows if r["type"] == "income"))
+    expenses = float(sum(r["amount"] for r in rows if r["type"] == "expense"))
     cats = {}
     for r in rows:
         if r["type"] == "expense":
-            cats[r["category"]] = cats.get(r["category"], 0) + r["amount"]
-    return jsonify({"income": income, "expenses": expenses, "balance": income - expenses, "categories": cats})
+            cats[r["category"]] = round(cats.get(r["category"], 0.0) + float(r["amount"]), 2)
+    return jsonify({"income": income, "expenses": expenses, "balance": round(income - expenses, 2), "categories": cats})
 
 # ─── AI Budget Advisor ────────────────────────────────────────────────────────
 
@@ -868,7 +873,9 @@ body::after{
         <button class="mnav" onclick="changeMonth(-1)">←</button>
         <div class="mlabel" id="month-label">—</div>
         <button class="mnav" onclick="changeMonth(1)">→</button>
-        <div class="currency-badge"><span id="curr-flag">$</span> <span id="curr-code-badge">USD</span></div>
+        <div class="currency-badge" title="Change display currency" style="cursor:pointer;padding:0;">
+          <select id="currency-quick-select" onchange="quickChangeCurrency(this.value)" style="border:none;background:transparent;cursor:pointer;padding:6px 14px;font-size:0.8rem;font-weight:600;color:var(--ink2);font-family:'Outfit',sans-serif;outline:none;"></select>
+        </div>
       </div>
       <div class="cards">
         <div class="card card-hero">
@@ -1081,10 +1088,10 @@ body::after{
 <script>
 // ── State ────────────────────────────────────────────────────────
 const CURRENCIES = [
-  {code:'USD',sym:'$',flag:'🇺🇸'},
-  {code:'GBP',sym:'£',flag:'🇬🇧'},
-  {code:'EUR',sym:'€',flag:'🇪🇺'},
   {code:'INR',sym:'₹',flag:'🇮🇳'},
+  {code:'USD',sym:'$',flag:'🇺🇸'},
+  {code:'EUR',sym:'€',flag:'🇪🇺'},
+  {code:'GBP',sym:'£',flag:'🇬🇧'},
   {code:'JPY',sym:'¥',flag:'🇯🇵'},
   {code:'CAD',sym:'C$',flag:'🇨🇦'},
   {code:'AUD',sym:'A$',flag:'🇦🇺'},
@@ -1192,11 +1199,22 @@ async function showApp(email){
 // ── Currency ─────────────────────────────────────────────────────
 function updateCurrencyUI(){
   const c=getCurrInfo(userCurrency);
-  document.getElementById('curr-flag').textContent=c.sym;
-  document.getElementById('curr-code-badge').textContent=userCurrency;
+  // Update quick-select dropdown in dashboard header
+  const qs=document.getElementById('currency-quick-select');
+  if(qs){
+    qs.innerHTML=CURRENCIES.map(cur=>`<option value="${cur.code}" ${cur.code===userCurrency?'selected':''}>${cur.flag} ${cur.code}</option>`).join('');
+    qs.value=userCurrency;
+  }
   document.getElementById('add-sym').textContent=c.sym;
   // highlight settings grid
   document.querySelectorAll('.curr-opt').forEach(el=>el.classList.toggle('active',el.dataset.code===userCurrency));
+}
+async function quickChangeCurrency(code){
+  userCurrency=code;
+  updateCurrencyUI();
+  buildCurrencyPickers();
+  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:code})});
+  if(res.ok){ toast('Currency changed to '+code+'!'); loadDashboard(); }
 }
 
 function buildCurrencyGrid(){
@@ -1434,7 +1452,10 @@ async function submitTransaction(){
   document.getElementById('add-date').value=localToday();
   selectedCat='';
   setupCatPills();
-  toast('Entry added!');
+  toast('Entry added! ✓');
+  // Reload transactions and dashboard so stats update immediately
+  loadTransactions();
+  loadDashboard();
 }
 
 // ── AI Chat ───────────────────────────────────────────────────────
