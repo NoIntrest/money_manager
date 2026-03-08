@@ -11,7 +11,18 @@ from datetime import datetime, date
 from functools import wraps
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
+
+# ── Persistent secret key (fixes session loss on server restart) ──
+SECRET_KEY_FILE = "secret.key"
+if os.path.exists(SECRET_KEY_FILE):
+    with open(SECRET_KEY_FILE, "rb") as f:
+        app.secret_key = f.read()
+else:
+    key = os.urandom(32)
+    with open(SECRET_KEY_FILE, "wb") as f:
+        f.write(key)
+    app.secret_key = key
+
 DB = "money_app.db"
 
 # ─── Database ────────────────────────────────────────────────────────────────
@@ -669,7 +680,9 @@ const CATEGORIES = {
 
 let currentType = 'income';
 let selectedCategory = '';
-let currentMonth = new Date().toISOString().slice(0,7);
+// FIX: Use local date for current month, not toISOString() which can drift to prior month in UTC+
+const _now = new Date();
+let currentMonth = _now.getFullYear() + '-' + String(_now.getMonth() + 1).padStart(2, '0');
 let allTx = [];
 let txFilter = 'all';
 let pieChart = null;
@@ -712,8 +725,10 @@ function showApp(email) {
   document.getElementById('user-avatar').textContent=email[0].toUpperCase();
   updateMonthLabels();
   loadDashboard();
-  // Default today date
-  document.getElementById('add-date').valueAsDate=new Date();
+  // FIX: Set date using local YYYY-MM-DD string, not valueAsDate (which uses UTC midnight)
+  const today = new Date();
+  const localDate = today.getFullYear() + '-' + String(today.getMonth()+1).padStart(2,'0') + '-' + String(today.getDate()).padStart(2,'0');
+  document.getElementById('add-date').value = localDate;
   setupCategoryPills();
 }
 
@@ -730,20 +745,24 @@ function showPage(name) {
 }
 
 // ── Month ─────────────────────────────────────────────────────────
+// FIX: Use local date math — never toISOString() which shifts timezone to UTC
 function changeMonth(dir) {
-  const [y,m] = currentMonth.split('-').map(Number);
-  const d = new Date(y,m-1+dir,1);
-  currentMonth = d.toISOString().slice(0,7);
+  let [y, m] = currentMonth.split('-').map(Number);
+  m += dir;
+  if (m > 12) { m = 1; y++; }
+  if (m < 1)  { m = 12; y--; }
+  currentMonth = y + '-' + String(m).padStart(2, '0');
   updateMonthLabels();
   const active = document.querySelector('.page.active');
   if(active.id==='page-dashboard') loadDashboard();
   else if(active.id==='page-transactions') loadTransactions();
 }
 function updateMonthLabels() {
-  const [y,m] = currentMonth.split('-');
-  const label = new Date(y,m-1,1).toLocaleDateString('en-GB',{month:'long',year:'numeric'});
-  document.getElementById('month-label').textContent=label;
-  document.getElementById('month-label-2').textContent=label;
+  const [y, m] = currentMonth.split('-').map(Number);
+  // FIX: Use local Date constructor, not ISO string, to avoid UTC offset issues
+  const label = new Date(y, m - 1, 1).toLocaleDateString('en-GB', {month:'long', year:'numeric'});
+  document.getElementById('month-label').textContent = label;
+  document.getElementById('month-label-2').textContent = label;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────
@@ -869,7 +888,8 @@ async function submitTransaction() {
   // Reset
   document.getElementById('add-amount').value='';
   document.getElementById('add-note').value='';
-  document.getElementById('add-date').valueAsDate=new Date();
+  const td = new Date();
+  document.getElementById('add-date').value = td.getFullYear() + '-' + String(td.getMonth()+1).padStart(2,'0') + '-' + String(td.getDate()).padStart(2,'0');
   selectedCategory='';
   setupCategoryPills();
 
