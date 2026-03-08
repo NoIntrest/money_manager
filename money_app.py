@@ -12,16 +12,7 @@ from functools import wraps
 
 app = Flask(__name__)
 
-# ── Persistent secret key (fixes session loss on server restart) ──
-SECRET_KEY_FILE = "secret.key"
-if os.path.exists(SECRET_KEY_FILE):
-    with open(SECRET_KEY_FILE, "rb") as f:
-        app.secret_key = f.read()
-else:
-    key = os.urandom(32)
-    with open(SECRET_KEY_FILE, "wb") as f:
-        f.write(key)
-    app.secret_key = key
+app.secret_key = os.environ.get("SECRET_KEY", "local-dev-fallback-key")
 
 DB = "money_app.db"
 
