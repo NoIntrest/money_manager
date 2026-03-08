@@ -1508,6 +1508,14 @@ async function saveAiKeyFromSettings(){
 </body>
 </html>"""
 
+# ─── Auto-create tables on startup (works with both Gunicorn and direct run) ───
+# This runs when Gunicorn imports the module on Render, ensuring tables exist.
+if DATABASE_URL:
+    try:
+        init_db()
+    except Exception as e:
+        print(f"⚠️  Could not initialise DB on startup: {e}")
+
 if __name__ == "__main__":
     init_db()
     print("\n💰 Vault — Money Manager v2")
