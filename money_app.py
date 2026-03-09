@@ -25,7 +25,7 @@ app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-pro
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama3-8b-8192")
+GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 def get_db():
     """Return a new psycopg2 connection. Render injects DATABASE_URL."""
@@ -1050,7 +1050,7 @@ body::after{
           <div class="ai-key-card" id="ai-status-card">
             <div class="ai-key-title">⚡ Groq AI</div>
             <div id="ai-status-msg" style="font-size:0.74rem;line-height:1.6;">Checking status...</div>
-            <p style="font-size:0.68rem;color:var(--ink3);margin-top:10px;">Model: <code id="groq-model-badge" style="font-size:0.68rem;background:var(--surface2);padding:1px 5px;border-radius:4px;">llama3-8b-8192</code></p>
+            <p style="font-size:0.68rem;color:var(--ink3);margin-top:10px;">Model: <code id="groq-model-badge" style="font-size:0.68rem;background:var(--surface2);padding:1px 5px;border-radius:4px;">llama-3.3-70b-versatile</code></p>
           </div>
         </div>
       </div>
@@ -1089,8 +1089,8 @@ body::after{
             </div>
             <div>
               <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Active Model</label>
-              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-groq-model">llama3-8b-8192</div>
-              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Other fast free models: <code>llama3-70b-8192</code>, <code>mixtral-8x7b-32768</code></p>
+              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-groq-model">llama-3.3-70b-versatile</div>
+              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Other free models: <code>llama-3.1-8b-instant</code>, <code>llama3-70b-8192</code></p>
               <p style="font-size:0.7rem;color:var(--ink3);margin-top:4px;">Set <code>GROQ_MODEL</code> env var in Render to change model.</p>
             </div>
           </div>
@@ -1522,7 +1522,7 @@ function appendMsg(role,text){
   const data=await res.json();
   if(data.logged_in){
     userCurrency=data.currency||'USD';
-    const model=data.groq_model||'llama3-8b-8192';
+    const model=data.groq_model||'llama-3.3-70b-versatile';
     const mb=document.getElementById('groq-model-badge');
     const sb=document.getElementById('settings-groq-model');
     if(mb) mb.textContent=model;
