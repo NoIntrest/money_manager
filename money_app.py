@@ -209,7 +209,7 @@ def get_transactions():
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return jsonify([dict(r) for r in rows])
+    return jsonify([{**dict(r), 'amount': float(r['amount'])} for r in rows])
 
 @app.route("/api/transactions", methods=["POST"])
 @login_required
