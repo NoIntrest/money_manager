@@ -9,7 +9,7 @@ Open: http://localhost:5000
 """
 
 from flask import Flask, request, jsonify, session
-import hashlib, os, json, requests as req
+import bcrypt, os, json, requests as req
 from datetime import datetime, date
 from functools import wraps
 import psycopg2
@@ -24,6 +24,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-pro
 # you want to test locally with PostgreSQL too.
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
 
 def get_db():
     """Return a new psycopg2 connection. Render injects DATABASE_URL."""
@@ -69,7 +71,10 @@ def init_db():
     conn.close()
 
 def hash_pw(pw):
-    return hashlib.sha256(pw.encode()).hexdigest()
+    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
+
+def check_pw(pw, hashed):
+    return bcrypt.checkpw(pw.encode(), hashed.encode())
 
 def login_required(f):
     @wraps(f)
@@ -117,10 +122,10 @@ def login():
     password = data.get("password", "")
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE email=%s AND password=%s", (email, hash_pw(password)))
+    cur.execute("SELECT * FROM users WHERE email=%s", (email,))
     user = cur.fetchone()
     cur.close(); conn.close()
-    if not user:
+    if not user or not check_pw(password, user["password"]):
         return jsonify({"error": "Invalid email or password"}), 401
     session["user_id"] = user["id"]
     session["email"] = user["email"]
@@ -141,7 +146,7 @@ def me():
     user = cur.fetchone()
     cur.close(); conn.close()
     has_key = bool(user["anthropic_key"]) if user else False
-    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key})
+    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key, "ollama_model": OLLAMA_MODEL})
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -204,12 +209,7 @@ def get_transactions():
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    result = []
-    for r in rows:
-        d = dict(r)
-        d["amount"] = float(d["amount"])
-        result.append(d)
-    return jsonify(result)
+    return jsonify([dict(r) for r in rows])
 
 @app.route("/api/transactions", methods=["POST"])
 @login_required
@@ -254,21 +254,35 @@ def summary():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
+    user = cur.fetchone()
+    user_currency = (user["currency"] or "USD") if user else "USD"
     cur.execute(
-        "SELECT type, category, amount FROM transactions WHERE user_id=%s AND date LIKE %s",
+        "SELECT type, category, amount, currency FROM transactions WHERE user_id=%s AND date LIKE %s",
         (session["user_id"], f"{month}%")
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    income = float(sum(r["amount"] for r in rows if r["type"] == "income"))
-    expenses = float(sum(r["amount"] for r in rows if r["type"] == "expense"))
+
+    rates = _rates_cache.get("data", {})
+
+    def to_display(amount, from_cur):
+        """Convert amount from from_cur to user_currency via USD as base."""
+        from_cur = from_cur or "USD"
+        if not rates or from_cur == user_currency:
+            return float(amount)
+        usd = float(amount) / rates.get(from_cur, 1)
+        return usd * rates.get(user_currency, 1)
+
+    income   = sum(to_display(r["amount"], r["currency"]) for r in rows if r["type"] == "income")
+    expenses = sum(to_display(r["amount"], r["currency"]) for r in rows if r["type"] == "expense")
     cats = {}
     for r in rows:
         if r["type"] == "expense":
-            cats[r["category"]] = round(cats.get(r["category"], 0.0) + float(r["amount"]), 2)
-    return jsonify({"income": income, "expenses": expenses, "balance": round(income - expenses, 2), "categories": cats})
+            cats[r["category"]] = cats.get(r["category"], 0) + to_display(r["amount"], r["currency"])
+    return jsonify({"income": income, "expenses": expenses, "balance": income - expenses, "categories": cats, "display_currency": user_currency})
 
-# ─── AI Budget Advisor ────────────────────────────────────────────────────────
+# ─── AI Budget Advisor (Ollama) ───────────────────────────────────────────────
 
 @app.route("/api/ai-chat", methods=["POST"])
 @login_required
@@ -278,32 +292,26 @@ def ai_chat():
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
-    # Get user's Anthropic key + recent transactions for context
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT anthropic_key, currency FROM users WHERE id=%s", (session["user_id"],))
+    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
     user = cur.fetchone()
     cur.execute(
-        "SELECT type, amount, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
+        "SELECT type, amount, currency, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
         (session["user_id"],)
     )
     txs = cur.fetchall()
     cur.close(); conn.close()
 
-    api_key = user["anthropic_key"] if user else ""
-    currency = user["currency"] if user else "USD"
+    currency = (user["currency"] or "USD") if user else "USD"
 
-    if not api_key:
-        return jsonify({"error": "no_key", "reply": "Please add your Anthropic API key in Settings to use the AI advisor."}), 200
-
-    # Build transaction summary for context
     tx_summary = "\n".join([
-        f"- {t['date']} | {t['type'].upper()} | {currency}{t['amount']:.2f} | {t['category']} | {t['note'] or ''}"
+        f"- {t['date']} | {t['type'].upper()} | {t['currency'] or currency}{float(t['amount']):.2f} | {t['category']} | {t['note'] or ''}"
         for t in txs
     ]) or "No transactions yet."
 
-    income_total = sum(t["amount"] for t in txs if t["type"] == "income")
-    expense_total = sum(t["amount"] for t in txs if t["type"] == "expense")
+    income_total  = sum(float(t["amount"]) for t in txs if t["type"] == "income")
+    expense_total = sum(float(t["amount"]) for t in txs if t["type"] == "expense")
 
     system_prompt = f"""You are Vault AI, a friendly and insightful personal finance advisor built into the Vault money management app.
 The user's preferred currency is {currency}.
@@ -316,26 +324,24 @@ Give practical, specific, actionable advice based on THEIR actual data. Be warm 
 
     try:
         response = req.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json"
-            },
+            f"{OLLAMA_URL}/api/chat",
             json={
-                "model": "claude-sonnet-4-20250514",
-                "max_tokens": 500,
-                "system": system_prompt,
-                "messages": [{"role": "user", "content": user_message}]
+                "model": OLLAMA_MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": user_message}
+                ]
             },
-            timeout=30
+            timeout=60
         )
-        result = response.json()
         if response.status_code != 200:
-            err = result.get("error", {}).get("message", "API error")
-            return jsonify({"error": err}), 400
-        reply = result["content"][0]["text"]
+            return jsonify({"error": f"Ollama returned {response.status_code}: {response.text[:200]}"}), 400
+        result = response.json()
+        reply = result["message"]["content"]
         return jsonify({"reply": reply})
+    except req.exceptions.ConnectionError:
+        return jsonify({"error": "ollama_offline"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -873,9 +879,7 @@ body::after{
         <button class="mnav" onclick="changeMonth(-1)">←</button>
         <div class="mlabel" id="month-label">—</div>
         <button class="mnav" onclick="changeMonth(1)">→</button>
-        <div class="currency-badge" title="Change display currency" style="cursor:pointer;padding:0;">
-          <select id="currency-quick-select" onchange="quickChangeCurrency(this.value)" style="border:none;background:transparent;cursor:pointer;padding:6px 14px;font-size:0.8rem;font-weight:600;color:var(--ink2);font-family:'Outfit',sans-serif;outline:none;"></select>
-        </div>
+        <div class="currency-badge"><span id="curr-flag">$</span> <span id="curr-code-badge">USD</span></div>
       </div>
       <div class="cards">
         <div class="card card-hero">
@@ -1007,7 +1011,7 @@ body::after{
     <div class="page" id="page-ai">
       <div class="page-header">
         <div class="page-title">AI Advisor</div>
-        <div class="page-sub">Powered by Claude AI</div>
+        <div class="page-sub">Powered by Ollama · Runs locally · Free</div>
       </div>
       <div class="ai-layout">
         <div class="chat-card">
@@ -1039,10 +1043,10 @@ body::after{
             <button class="ai-tip-btn" onclick="askQuick('Create a simple budget plan for next month based on my history.')">Build a budget plan</button>
           </div>
           <div class="ai-key-card">
-            <div class="ai-key-title">🔑 Anthropic API Key</div>
-            <p style="font-size:0.74rem;color:var(--amber);margin-bottom:10px;line-height:1.5;">Required to use AI features. Get yours free at console.anthropic.com</p>
-            <input class="ai-key-input" type="password" id="ai-key-input" placeholder="sk-ant-..."/>
-            <button class="ai-key-btn" onclick="saveAiKey()">Save Key</button>
+            <div class="ai-key-title">🦙 Ollama — Local AI</div>
+            <p style="font-size:0.74rem;color:var(--green);margin-bottom:10px;line-height:1.5;">✓ Runs 100% on your machine — no API fees, no data sent online.</p>
+            <p style="font-size:0.72rem;color:var(--ink3);line-height:1.6;margin-bottom:8px;">Make sure Ollama is running:<br/><code style="font-size:0.7rem;background:var(--surface2);padding:2px 6px;border-radius:4px;">ollama serve</code></p>
+            <p style="font-size:0.72rem;color:var(--ink3);line-height:1.6;">Model: <code id="ollama-model-badge" style="font-size:0.7rem;background:var(--surface2);padding:2px 6px;border-radius:4px;">llama3</code><br/>Change with env var <code style="font-size:0.7rem;">OLLAMA_MODEL</code></p>
           </div>
         </div>
       </div>
@@ -1067,15 +1071,25 @@ body::after{
           <div class="rates-grid" id="rates-grid"><div style="color:var(--ink3);font-size:0.8rem;">Loading...</div></div>
         </div>
         <div class="settings-card" style="grid-column:1/-1;">
-          <div class="settings-section-title">🔑 AI Advisor Key</div>
-          <div style="display:flex;gap:12px;align-items:flex-end;">
-            <div style="flex:1;">
-              <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Anthropic API Key</label>
-              <input type="password" id="settings-ai-key" placeholder="sk-ant-..." style="width:100%;padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--ink);"/>
+          <div class="settings-section-title">🦙 AI Advisor — Ollama</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
+            <div>
+              <p style="font-size:0.78rem;color:var(--ink2);line-height:1.7;margin-bottom:10px;">
+                The AI advisor runs entirely on your own machine using <strong>Ollama</strong> — no API key, no fees, completely private.
+              </p>
+              <p style="font-size:0.72rem;color:var(--ink3);line-height:1.7;">
+                1. Install Ollama from <strong>ollama.com</strong><br/>
+                2. Run: <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">ollama pull llama3</code><br/>
+                3. Start: <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">ollama serve</code>
+              </p>
             </div>
-            <button class="save-btn" onclick="saveAiKeyFromSettings()">Save</button>
+            <div>
+              <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Active Model</label>
+              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-ollama-model">llama3</div>
+              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Set <code>OLLAMA_MODEL</code> env var to change model (e.g. mistral, llama3:8b)</p>
+              <p style="font-size:0.7rem;color:var(--ink3);margin-top:4px;">Set <code>OLLAMA_URL</code> to use a remote Ollama instance</p>
+            </div>
           </div>
-          <p style="font-size:0.72rem;color:var(--ink3);margin-top:10px;">Key is stored securely in your account. Never shared. Get a free key at <strong>console.anthropic.com</strong></p>
         </div>
       </div>
     </div>
@@ -1088,10 +1102,10 @@ body::after{
 <script>
 // ── State ────────────────────────────────────────────────────────
 const CURRENCIES = [
-  {code:'INR',sym:'₹',flag:'🇮🇳'},
   {code:'USD',sym:'$',flag:'🇺🇸'},
-  {code:'EUR',sym:'€',flag:'🇪🇺'},
   {code:'GBP',sym:'£',flag:'🇬🇧'},
+  {code:'EUR',sym:'€',flag:'🇪🇺'},
+  {code:'INR',sym:'₹',flag:'🇮🇳'},
   {code:'JPY',sym:'¥',flag:'🇯🇵'},
   {code:'CAD',sym:'C$',flag:'🇨🇦'},
   {code:'AUD',sym:'A$',flag:'🇦🇺'},
@@ -1199,22 +1213,11 @@ async function showApp(email){
 // ── Currency ─────────────────────────────────────────────────────
 function updateCurrencyUI(){
   const c=getCurrInfo(userCurrency);
-  // Update quick-select dropdown in dashboard header
-  const qs=document.getElementById('currency-quick-select');
-  if(qs){
-    qs.innerHTML=CURRENCIES.map(cur=>`<option value="${cur.code}" ${cur.code===userCurrency?'selected':''}>${cur.flag} ${cur.code}</option>`).join('');
-    qs.value=userCurrency;
-  }
+  document.getElementById('curr-flag').textContent=c.sym;
+  document.getElementById('curr-code-badge').textContent=userCurrency;
   document.getElementById('add-sym').textContent=c.sym;
   // highlight settings grid
   document.querySelectorAll('.curr-opt').forEach(el=>el.classList.toggle('active',el.dataset.code===userCurrency));
-}
-async function quickChangeCurrency(code){
-  userCurrency=code;
-  updateCurrencyUI();
-  buildCurrencyPickers();
-  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:code})});
-  if(res.ok){ toast('Currency changed to '+code+'!'); loadDashboard(); }
 }
 
 function buildCurrencyGrid(){
@@ -1452,10 +1455,7 @@ async function submitTransaction(){
   document.getElementById('add-date').value=localToday();
   selectedCat='';
   setupCatPills();
-  toast('Entry added! ✓');
-  // Reload transactions and dashboard so stats update immediately
-  loadTransactions();
-  loadDashboard();
+  toast('Entry added!');
 }
 
 // ── AI Chat ───────────────────────────────────────────────────────
@@ -1483,8 +1483,8 @@ async function sendChat(){
   const data=await res.json();
   document.getElementById(typingId)?.remove();
   send.disabled=false;
-  if(data.error==='no_key'){
-    appendMsg('ai','⚠️ Please add your Anthropic API key in the Settings page or in the panel on the right to use AI features.');
+  if(data.error==='ollama_offline'){
+    appendMsg('ai','⚠️ Ollama is not running. Start it with:\n\n  ollama serve\n\nMake sure you have pulled a model first:\n  ollama pull llama3');
   } else if(data.error){
     appendMsg('ai','⚠️ Error: '+data.error);
   } else {
@@ -1495,47 +1495,40 @@ function appendMsg(role,text){
   const messages=document.getElementById('chat-messages');
   const time=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
   const label=role==='user'?'You':'Vault AI';
-  messages.innerHTML+=`<div class="msg ${role}">
-    <div class="msg-bubble">${text.replace(/\n/g,'<br/>')}</div>
-    <div class="msg-time">${label} · ${time}</div>
-  </div>`;
+  const div=document.createElement('div');
+  div.className=`msg ${role}`;
+  const bubble=document.createElement('div');
+  bubble.className='msg-bubble';
+  // Safe: split on newlines, insert text nodes + <br> — no innerHTML, no XSS
+  text.split('\n').forEach((line,i)=>{
+    if(i>0) bubble.appendChild(document.createElement('br'));
+    bubble.appendChild(document.createTextNode(line));
+  });
+  const timeDiv=document.createElement('div');
+  timeDiv.className='msg-time';
+  timeDiv.textContent=`${label} · ${time}`;
+  div.appendChild(bubble);
+  div.appendChild(timeDiv);
+  messages.appendChild(div);
   messages.scrollTop=messages.scrollHeight;
 }
-async function saveAiKey(){
-  const key=document.getElementById('ai-key-input').value.trim();
-  if(!key){toast('Please enter a key','var(--red)');return;}
-  // FIX Bug 1: only send anthropic_key — don't accidentally overwrite currency
-  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anthropic_key:key})});
-  if(res.ok){toast('API key saved! AI is ready.');document.getElementById('ai-key-input').value='';}
-}
-async function saveAiKeyFromSettings(){
-  const key=document.getElementById('settings-ai-key').value.trim();
-  if(!key){toast('Please enter a key','var(--red)');return;}
-  // FIX Bug 1: only send anthropic_key — don't accidentally overwrite currency
-  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anthropic_key:key})});
-  if(res.ok){toast('API key saved!');document.getElementById('settings-ai-key').value='';}
-}
-
 // ── Boot ──────────────────────────────────────────────────────────
 (async()=>{
   const res=await fetch('/api/me');
   const data=await res.json();
   if(data.logged_in){
     userCurrency=data.currency||'USD';
+    const model=data.ollama_model||'llama3';
+    const mb=document.getElementById('ollama-model-badge');
+    const sb=document.getElementById('settings-ollama-model');
+    if(mb) mb.textContent=model;
+    if(sb) sb.textContent=model;
     showApp(data.email);
   }
 })();
 </script>
 </body>
 </html>"""
-
-# ─── Auto-create tables on startup (works with both Gunicorn and direct run) ───
-# This runs when Gunicorn imports the module on Render, ensuring tables exist.
-if DATABASE_URL:
-    try:
-        init_db()
-    except Exception as e:
-        print(f"⚠️  Could not initialise DB on startup: {e}")
 
 if __name__ == "__main__":
     init_db()
