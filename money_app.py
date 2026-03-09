@@ -8,15 +8,69 @@ On Render:  Set DATABASE_URL env var from your Render PostgreSQL instance
 Open: http://localhost:5000
 """
 
-from flask import Flask, request, jsonify, session
-import bcrypt, os, json, requests as req
-from datetime import datetime, date
+from flask import Flask, request, jsonify, session, redirect
+import hashlib, os, json, requests as req, secrets, smtplib
+from datetime import datetime, date, timedelta
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from functools import wraps
 import psycopg2
 import psycopg2.extras
+from authlib.integrations.flask_client import OAuth
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-prod")
+
+# ─── Google OAuth (optional — only active if env vars are set) ────────────────
+GOOGLE_CLIENT_ID     = os.environ.get('GOOGLE_CLIENT_ID')
+GOOGLE_CLIENT_SECRET = os.environ.get('GOOGLE_CLIENT_SECRET')
+GOOGLE_ENABLED = bool(GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET)
+
+oauth  = OAuth(app)
+google = None
+if GOOGLE_ENABLED:
+    try:
+        google = oauth.register(
+            name='google',
+            client_id=GOOGLE_CLIENT_ID,
+            client_secret=GOOGLE_CLIENT_SECRET,
+            server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+            client_kwargs={'scope': 'openid email profile'}
+        )
+    except Exception as e:
+        print(f"⚠️  Google OAuth setup failed: {e}")
+        GOOGLE_ENABLED = False
+
+# ─── Email helper ──────────────────────────────────────────────────────────────
+MAIL_USER = os.environ.get("MAIL_USERNAME", "")
+MAIL_PASS = os.environ.get("MAIL_PASSWORD", "")
+APP_URL   = os.environ.get("APP_URL", "http://localhost:5000")
+
+def send_reset_email(to_email, token):
+    if not MAIL_USER or not MAIL_PASS:
+        return False
+    reset_link = f"{APP_URL}/reset-password?token={token}"
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = "Vault — Reset Your Password"
+    msg["From"]    = MAIL_USER
+    msg["To"]      = to_email
+    html = f"""
+    <div style="font-family:sans-serif;max-width:480px;margin:auto;padding:32px;">
+      <h2 style="font-size:1.6rem;font-weight:900;margin-bottom:4px;">Vau<span style="color:#f07020">lt</span></h2>
+      <p style="color:#555;margin-bottom:24px;">Smart Money Manager</p>
+      <p>You requested a password reset. Click the button below — this link expires in <strong>30 minutes</strong>.</p>
+      <a href="{reset_link}" style="display:inline-block;margin:24px 0;padding:14px 28px;background:linear-gradient(135deg,#e03c2a,#f07020);color:#fff;text-decoration:none;border-radius:8px;font-weight:700;">Reset Password →</a>
+      <p style="font-size:0.8rem;color:#999;">If you didn't request this, ignore this email. Your password won't change.</p>
+    </div>"""
+    msg.attach(MIMEText(html, "html"))
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(MAIL_USER, MAIL_PASS)
+            smtp.sendmail(MAIL_USER, to_email, msg.as_string())
+        return True
+    except Exception as e:
+        print(f"Mail error: {e}")
+        return False
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 # Reads DATABASE_URL from environment (set by Render automatically when you
@@ -24,8 +78,6 @@ app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-pro
 # you want to test locally with PostgreSQL too.
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 def get_db():
     """Return a new psycopg2 connection. Render injects DATABASE_URL."""
@@ -47,11 +99,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS users (
             id SERIAL PRIMARY KEY,
             email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            currency TEXT DEFAULT 'USD',
+            password TEXT,
+            currency TEXT DEFAULT 'INR',
             anthropic_key TEXT DEFAULT '',
+            google_id TEXT UNIQUE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
+    """)
+    # Add google_id column to existing deployments
+    cur.execute("""
+        ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE
     """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS transactions (
@@ -59,11 +116,20 @@ def init_db():
             user_id INTEGER NOT NULL REFERENCES users(id),
             type TEXT NOT NULL,
             amount NUMERIC(14,2) NOT NULL,
-            currency TEXT DEFAULT 'USD',
+            currency TEXT DEFAULT 'INR',
             category TEXT,
             note TEXT,
             date TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id),
+            token TEXT UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            used BOOLEAN DEFAULT FALSE
         )
     """)
     conn.commit()
@@ -71,10 +137,7 @@ def init_db():
     conn.close()
 
 def hash_pw(pw):
-    return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
-
-def check_pw(pw, hashed):
-    return bcrypt.checkpw(pw.encode(), hashed.encode())
+    return hashlib.sha256(pw.encode()).hexdigest()
 
 def login_required(f):
     @wraps(f)
@@ -122,10 +185,10 @@ def login():
     password = data.get("password", "")
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+    cur.execute("SELECT * FROM users WHERE email=%s AND password=%s", (email, hash_pw(password)))
     user = cur.fetchone()
     cur.close(); conn.close()
-    if not user or not check_pw(password, user["password"]):
+    if not user:
         return jsonify({"error": "Invalid email or password"}), 401
     session["user_id"] = user["id"]
     session["email"] = user["email"]
@@ -136,17 +199,134 @@ def logout():
     session.clear()
     return jsonify({"success": True})
 
+# ─── Google OAuth ──────────────────────────────────────────────────────────────
+
+@app.route("/api/auth/google")
+def google_login():
+    if not GOOGLE_ENABLED or not google:
+        return jsonify({"error": "Google login not configured. Add GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in Render environment variables."}), 503
+    redirect_uri = f"{APP_URL}/api/auth/google/callback"
+    return google.authorize_redirect(redirect_uri)
+
+@app.route("/api/auth/google/callback")
+def google_callback():
+    if not GOOGLE_ENABLED or not google:
+        return redirect("/?error=Google+login+not+configured")
+    try:
+        token = google.authorize_access_token()
+        user_info = token.get("userinfo")
+        if not user_info:
+            user_info = google.userinfo()
+        email = user_info["email"]
+        google_id = user_info["sub"]
+        conn = get_db()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Check if user exists by google_id or email
+        cur.execute("SELECT * FROM users WHERE google_id=%s OR email=%s", (google_id, email))
+        user = cur.fetchone()
+        if user:
+            # Update google_id if missing
+            if not user["google_id"]:
+                cur.execute("UPDATE users SET google_id=%s WHERE id=%s", (google_id, user["id"]))
+                conn.commit()
+            session["user_id"] = user["id"]
+            session["email"] = user["email"]
+        else:
+            # New user via Google
+            cur.execute(
+                "INSERT INTO users (email, google_id, currency) VALUES (%s,%s,'INR') RETURNING *",
+                (email, google_id)
+            )
+            conn.commit()
+            new_user = cur.fetchone()
+            if not new_user:
+                cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+                new_user = cur.fetchone()
+            session["user_id"] = new_user["id"]
+            session["email"] = email
+        cur.close(); conn.close()
+        return redirect("/?logged_in=1")
+    except Exception as e:
+        return redirect(f"/?error={str(e)[:80]}")
+
+# ─── Forgot / Reset Password ───────────────────────────────────────────────────
+
+@app.route("/api/forgot-password", methods=["POST"])
+def forgot_password():
+    data = request.json
+    email = data.get("email", "").strip().lower()
+    if not email:
+        return jsonify({"error": "Email required"}), 400
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+    user = cur.fetchone()
+    if not user:
+        cur.close(); conn.close()
+        # Don't reveal if email exists
+        return jsonify({"success": True, "message": "If that email exists, a reset link was sent."})
+    token = secrets.token_urlsafe(32)
+    expires = datetime.utcnow() + timedelta(minutes=30)
+    cur2 = conn.cursor()
+    cur2.execute(
+        "INSERT INTO password_reset_tokens (user_id, token, expires_at) VALUES (%s,%s,%s)",
+        (user["id"], token, expires)
+    )
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+    sent = send_reset_email(email, token)
+    if not sent:
+        return jsonify({"error": "Could not send email. Check MAIL_USERNAME and MAIL_PASSWORD env vars."}), 500
+    return jsonify({"success": True, "message": "Reset link sent! Check your inbox."})
+
+@app.route("/api/reset-password", methods=["POST"])
+def reset_password():
+    data = request.json
+    token = data.get("token", "").strip()
+    new_password = data.get("password", "")
+    if not token or not new_password:
+        return jsonify({"error": "Token and new password required"}), 400
+    if len(new_password) < 6:
+        return jsonify({"error": "Password must be at least 6 characters"}), 400
+    conn = get_db()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM password_reset_tokens WHERE token=%s AND used=FALSE", (token,))
+    rec = cur.fetchone()
+    if not rec:
+        cur.close(); conn.close()
+        return jsonify({"error": "Invalid or already used reset link"}), 400
+    if datetime.utcnow() > rec["expires_at"]:
+        cur.close(); conn.close()
+        return jsonify({"error": "Reset link has expired. Please request a new one."}), 400
+    cur2 = conn.cursor()
+    cur2.execute("UPDATE users SET password=%s WHERE id=%s", (hash_pw(new_password), rec["user_id"]))
+    cur2.execute("UPDATE password_reset_tokens SET used=TRUE WHERE id=%s", (rec["id"],))
+    conn.commit()
+    cur.close(); cur2.close(); conn.close()
+    return jsonify({"success": True, "message": "Password updated! You can now sign in."})
+
 @app.route("/api/me")
 def me():
     if "user_id" not in session:
         return jsonify({"logged_in": False})
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT email, currency, anthropic_key FROM users WHERE id=%s", (session["user_id"],))
+    cur.execute("SELECT email, currency, anthropic_key, google_id FROM users WHERE id=%s", (session["user_id"],))
     user = cur.fetchone()
     cur.close(); conn.close()
     has_key = bool(user["anthropic_key"]) if user else False
-    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key, "groq_ready": bool(GROQ_API_KEY), "groq_model": GROQ_MODEL})
+    return jsonify({
+        "logged_in": True,
+        "email": user["email"],
+        "currency": user["currency"] or "INR",
+        "has_ai_key": has_key,
+        "google_user": bool(user.get("google_id"))
+    })
+
+@app.route("/reset-password")
+def reset_password_page():
+    """Serve the main app — JS will detect the token in the URL."""
+    return FRONTEND
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -209,7 +389,12 @@ def get_transactions():
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-    return jsonify([{**dict(r), 'amount': float(r['amount'])} for r in rows])
+    result = []
+    for r in rows:
+        d = dict(r)
+        d["amount"] = float(d["amount"])
+        result.append(d)
+    return jsonify(result)
 
 @app.route("/api/transactions", methods=["POST"])
 @login_required
@@ -254,35 +439,21 @@ def summary():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
-    user = cur.fetchone()
-    user_currency = (user["currency"] or "USD") if user else "USD"
     cur.execute(
-        "SELECT type, category, amount, currency FROM transactions WHERE user_id=%s AND date LIKE %s",
+        "SELECT type, category, amount FROM transactions WHERE user_id=%s AND date LIKE %s",
         (session["user_id"], f"{month}%")
     )
     rows = cur.fetchall()
     cur.close(); conn.close()
-
-    rates = _rates_cache.get("data", {})
-
-    def to_display(amount, from_cur):
-        """Convert amount from from_cur to user_currency via USD as base."""
-        from_cur = from_cur or "USD"
-        if not rates or from_cur == user_currency:
-            return float(amount)
-        usd = float(amount) / rates.get(from_cur, 1)
-        return usd * rates.get(user_currency, 1)
-
-    income   = sum(to_display(r["amount"], r["currency"]) for r in rows if r["type"] == "income")
-    expenses = sum(to_display(r["amount"], r["currency"]) for r in rows if r["type"] == "expense")
+    income = float(sum(r["amount"] for r in rows if r["type"] == "income"))
+    expenses = float(sum(r["amount"] for r in rows if r["type"] == "expense"))
     cats = {}
     for r in rows:
         if r["type"] == "expense":
-            cats[r["category"]] = cats.get(r["category"], 0) + to_display(r["amount"], r["currency"])
-    return jsonify({"income": income, "expenses": expenses, "balance": income - expenses, "categories": cats, "display_currency": user_currency})
+            cats[r["category"]] = round(cats.get(r["category"], 0.0) + float(r["amount"]), 2)
+    return jsonify({"income": income, "expenses": expenses, "balance": round(income - expenses, 2), "categories": cats})
 
-# ─── AI Budget Advisor (Groq) ─────────────────────────────────────────────────
+# ─── AI Budget Advisor ────────────────────────────────────────────────────────
 
 @app.route("/api/ai-chat", methods=["POST"])
 @login_required
@@ -292,29 +463,32 @@ def ai_chat():
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
 
-    if not GROQ_API_KEY:
-        return jsonify({"error": "no_key"}), 200
-
+    # Get user's Anthropic key + recent transactions for context
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
+    cur.execute("SELECT anthropic_key, currency FROM users WHERE id=%s", (session["user_id"],))
     user = cur.fetchone()
     cur.execute(
-        "SELECT type, amount, currency, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
+        "SELECT type, amount, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
         (session["user_id"],)
     )
     txs = cur.fetchall()
     cur.close(); conn.close()
 
-    currency = (user["currency"] or "USD") if user else "USD"
+    api_key = user["anthropic_key"] if user else ""
+    currency = user["currency"] if user else "USD"
 
+    if not api_key:
+        return jsonify({"error": "no_key", "reply": "Please add your Anthropic API key in Settings to use the AI advisor."}), 200
+
+    # Build transaction summary for context
     tx_summary = "\n".join([
-        f"- {t['date']} | {t['type'].upper()} | {t['currency'] or currency}{float(t['amount']):.2f} | {t['category']} | {t['note'] or ''}"
+        f"- {t['date']} | {t['type'].upper()} | {currency}{t['amount']:.2f} | {t['category']} | {t['note'] or ''}"
         for t in txs
     ]) or "No transactions yet."
 
-    income_total  = sum(float(t["amount"]) for t in txs if t["type"] == "income")
-    expense_total = sum(float(t["amount"]) for t in txs if t["type"] == "expense")
+    income_total = sum(t["amount"] for t in txs if t["type"] == "income")
+    expense_total = sum(t["amount"] for t in txs if t["type"] == "expense")
 
     system_prompt = f"""You are Vault AI, a friendly and insightful personal finance advisor built into the Vault money management app.
 The user's preferred currency is {currency}.
@@ -327,32 +501,35 @@ Give practical, specific, actionable advice based on THEIR actual data. Be warm 
 
     try:
         response = req.post(
-            "https://api.groq.com/openai/v1/chat/completions",
+            "https://api.anthropic.com/v1/messages",
             headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json"
             },
             json={
-                "model": GROQ_MODEL,
+                "model": "claude-sonnet-4-20250514",
                 "max_tokens": 500,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message}
-                ]
+                "system": system_prompt,
+                "messages": [{"role": "user", "content": user_message}]
             },
             timeout=30
         )
+        result = response.json()
         if response.status_code != 200:
-            err = response.json().get("error", {}).get("message", "Groq API error")
+            err = result.get("error", {}).get("message", "API error")
             return jsonify({"error": err}), 400
-        reply = response.json()["choices"][0]["message"]["content"]
+        reply = result["content"][0]["text"]
         return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 # ─── Frontend ─────────────────────────────────────────────────────────────────
 
-@app.route("/api/health")
+@app.route("/api/config")
+def get_config():
+    """Return public feature flags to the frontend."""
+    return jsonify({"google_enabled": GOOGLE_ENABLED})
 def health():
     """Quick check — is the DB reachable?"""
     db_url = os.environ.get("DATABASE_URL", "")
@@ -477,6 +654,53 @@ body::after{
   letter-spacing:0.06em;cursor:pointer;transition:opacity 0.2s,transform 0.15s;
 }
 .auth-btn:hover{opacity:0.9;transform:translateY(-1px);}
+.auth-google-btn{
+  width:100%;padding:13px;margin-top:10px;
+  background:#fff;border:1.5px solid var(--border);border-radius:8px;
+  color:var(--ink);font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:600;
+  cursor:pointer;transition:all 0.2s;display:flex;align-items:center;justify-content:center;gap:10px;
+}
+.auth-google-btn:hover{border-color:#4285f4;box-shadow:0 2px 12px rgba(66,133,244,0.15);}
+.auth-divider{display:flex;align-items:center;gap:12px;margin:14px 0;color:var(--ink3);font-size:0.75rem;}
+.auth-divider::before,.auth-divider::after{content:'';flex:1;height:1px;background:var(--border);}
+.forgot-link{
+  display:block;text-align:right;margin-top:-8px;margin-bottom:14px;
+  font-size:0.75rem;color:var(--ink3);cursor:pointer;text-decoration:underline;
+  background:none;border:none;font-family:'Outfit',sans-serif;
+}
+.forgot-link:hover{color:var(--orange);}
+
+/* ── Modal overlay ─────────────────────────────────────────── */
+.modal-overlay{
+  display:none;position:fixed;inset:0;background:rgba(28,23,16,0.5);
+  z-index:999;align-items:center;justify-content:center;
+}
+.modal-overlay.open{display:flex;}
+.modal-box{
+  background:var(--surface);border-radius:16px;padding:40px;
+  width:100%;max-width:420px;box-shadow:var(--shadow-lg);
+  position:relative;
+}
+.modal-title{font-family:'Fraunces',serif;font-size:1.4rem;font-weight:700;margin-bottom:6px;}
+.modal-sub{font-size:0.8rem;color:var(--ink3);margin-bottom:24px;}
+.modal-close{
+  position:absolute;top:16px;right:16px;
+  background:none;border:none;font-size:1.3rem;cursor:pointer;color:var(--ink3);
+}
+.modal-close:hover{color:var(--ink);}
+.modal-input{
+  width:100%;padding:12px 16px;margin-bottom:14px;
+  background:var(--surface2);border:1.5px solid var(--border);
+  border-radius:8px;color:var(--ink);font-family:'Outfit',sans-serif;font-size:0.92rem;
+}
+.modal-input:focus{outline:none;border-color:var(--orange);}
+.modal-btn{
+  width:100%;padding:13px;background:var(--grad-card);border:none;border-radius:8px;
+  color:#fff;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:600;cursor:pointer;
+}
+.modal-msg{font-size:0.8rem;margin-top:12px;padding:10px 14px;border-radius:8px;display:none;}
+.modal-msg.ok{background:var(--green-soft);color:var(--green);}
+.modal-msg.err{background:var(--red-soft);color:var(--red);}
 .auth-error{
   background:var(--red-soft);border:1px solid rgba(224,60,42,0.3);color:var(--red);
   padding:10px 14px;border-radius:8px;font-size:0.78rem;margin-bottom:14px;display:none;
@@ -845,8 +1069,38 @@ body::after{
       <input class="auth-input" type="email" id="auth-email" placeholder="you@example.com"/>
       <label class="auth-field-label">Password</label>
       <input class="auth-input" type="password" id="auth-password" placeholder="••••••••"/>
+      <button class="forgot-link" id="forgot-link" onclick="openForgot()">Forgot password?</button>
       <button class="auth-btn" id="auth-btn" onclick="submitAuth()">Sign In →</button>
+      <div class="auth-divider">or</div>
+      <button class="auth-google-btn" onclick="window.location.href='/api/auth/google'">
+        <svg width="18" height="18" viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.18 1.48-4.97 2.35-8.16 2.35-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+        Continue with Google
+      </button>
     </div>
+  </div>
+</div>
+
+<!-- ── Forgot Password Modal ────────────────────────────────── -->
+<div class="modal-overlay" id="forgot-modal">
+  <div class="modal-box">
+    <button class="modal-close" onclick="closeForgot()">✕</button>
+    <div class="modal-title">Forgot Password?</div>
+    <div class="modal-sub">Enter your email and we'll send a reset link.</div>
+    <input class="modal-input" type="email" id="forgot-email" placeholder="you@example.com"/>
+    <button class="modal-btn" onclick="submitForgot()">Send Reset Link →</button>
+    <div class="modal-msg" id="forgot-msg"></div>
+  </div>
+</div>
+
+<!-- ── Reset Password Modal ─────────────────────────────────── -->
+<div class="modal-overlay" id="reset-modal">
+  <div class="modal-box">
+    <div class="modal-title">Set New Password</div>
+    <div class="modal-sub">Choose a strong password for your Vault account.</div>
+    <input class="modal-input" type="password" id="reset-password" placeholder="New password (min 6 chars)"/>
+    <input class="modal-input" type="password" id="reset-password2" placeholder="Confirm password"/>
+    <button class="modal-btn" onclick="submitReset()">Update Password →</button>
+    <div class="modal-msg" id="reset-msg"></div>
   </div>
 </div>
 
@@ -884,7 +1138,9 @@ body::after{
         <button class="mnav" onclick="changeMonth(-1)">←</button>
         <div class="mlabel" id="month-label">—</div>
         <button class="mnav" onclick="changeMonth(1)">→</button>
-        <div class="currency-badge"><span id="curr-flag">$</span> <span id="curr-code-badge">USD</span></div>
+        <div class="currency-badge" title="Change display currency" style="cursor:pointer;padding:0;">
+          <select id="currency-quick-select" onchange="quickChangeCurrency(this.value)" style="border:none;background:transparent;cursor:pointer;padding:6px 14px;font-size:0.8rem;font-weight:600;color:var(--ink2);font-family:'Outfit',sans-serif;outline:none;"></select>
+        </div>
       </div>
       <div class="cards">
         <div class="card card-hero">
@@ -1016,7 +1272,7 @@ body::after{
     <div class="page" id="page-ai">
       <div class="page-header">
         <div class="page-title">AI Advisor</div>
-        <div class="page-sub">Powered by Groq · Free · Fast</div>
+        <div class="page-sub">Powered by Claude AI</div>
       </div>
       <div class="ai-layout">
         <div class="chat-card">
@@ -1047,10 +1303,11 @@ body::after{
             <button class="ai-tip-btn" onclick="askQuick('Am I on track with my spending this month?')">Am I on track this month?</button>
             <button class="ai-tip-btn" onclick="askQuick('Create a simple budget plan for next month based on my history.')">Build a budget plan</button>
           </div>
-          <div class="ai-key-card" id="ai-status-card">
-            <div class="ai-key-title">⚡ Groq AI</div>
-            <div id="ai-status-msg" style="font-size:0.74rem;line-height:1.6;">Checking status...</div>
-            <p style="font-size:0.68rem;color:var(--ink3);margin-top:10px;">Model: <code id="groq-model-badge" style="font-size:0.68rem;background:var(--surface2);padding:1px 5px;border-radius:4px;">llama-3.3-70b-versatile</code></p>
+          <div class="ai-key-card">
+            <div class="ai-key-title">🔑 Anthropic API Key</div>
+            <p style="font-size:0.74rem;color:var(--amber);margin-bottom:10px;line-height:1.5;">Required to use AI features. Get yours free at console.anthropic.com</p>
+            <input class="ai-key-input" type="password" id="ai-key-input" placeholder="sk-ant-..."/>
+            <button class="ai-key-btn" onclick="saveAiKey()">Save Key</button>
           </div>
         </div>
       </div>
@@ -1075,25 +1332,15 @@ body::after{
           <div class="rates-grid" id="rates-grid"><div style="color:var(--ink3);font-size:0.8rem;">Loading...</div></div>
         </div>
         <div class="settings-card" style="grid-column:1/-1;">
-          <div class="settings-section-title">⚡ AI Advisor — Groq</div>
-          <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
-            <div>
-              <p style="font-size:0.78rem;color:var(--ink2);line-height:1.7;margin-bottom:10px;">
-                The AI advisor uses <strong>Groq's free tier</strong> — up to 14,400 requests/day running Llama 3. No credit card needed.
-              </p>
-              <p style="font-size:0.72rem;color:var(--ink3);line-height:1.7;">
-                1. Sign up free at <strong>console.groq.com</strong><br/>
-                2. Create an API key<br/>
-                3. Add it as <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">GROQ_API_KEY</code> in your Render environment variables
-              </p>
+          <div class="settings-section-title">🔑 AI Advisor Key</div>
+          <div style="display:flex;gap:12px;align-items:flex-end;">
+            <div style="flex:1;">
+              <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Anthropic API Key</label>
+              <input type="password" id="settings-ai-key" placeholder="sk-ant-..." style="width:100%;padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--ink);"/>
             </div>
-            <div>
-              <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Active Model</label>
-              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-groq-model">llama-3.3-70b-versatile</div>
-              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Other free models: <code>llama-3.1-8b-instant</code>, <code>llama3-70b-8192</code></p>
-              <p style="font-size:0.7rem;color:var(--ink3);margin-top:4px;">Set <code>GROQ_MODEL</code> env var in Render to change model.</p>
-            </div>
+            <button class="save-btn" onclick="saveAiKeyFromSettings()">Save</button>
           </div>
+          <p style="font-size:0.72rem;color:var(--ink3);margin-top:10px;">Key is stored securely in your account. Never shared. Get a free key at <strong>console.anthropic.com</strong></p>
         </div>
       </div>
     </div>
@@ -1106,10 +1353,10 @@ body::after{
 <script>
 // ── State ────────────────────────────────────────────────────────
 const CURRENCIES = [
-  {code:'USD',sym:'$',flag:'🇺🇸'},
-  {code:'GBP',sym:'£',flag:'🇬🇧'},
-  {code:'EUR',sym:'€',flag:'🇪🇺'},
   {code:'INR',sym:'₹',flag:'🇮🇳'},
+  {code:'USD',sym:'$',flag:'🇺🇸'},
+  {code:'EUR',sym:'€',flag:'🇪🇺'},
+  {code:'GBP',sym:'£',flag:'🇬🇧'},
   {code:'JPY',sym:'¥',flag:'🇯🇵'},
   {code:'CAD',sym:'C$',flag:'🇨🇦'},
   {code:'AUD',sym:'A$',flag:'🇦🇺'},
@@ -1159,6 +1406,47 @@ function switchTab(mode){
   document.querySelectorAll('.auth-tab').forEach((t,i)=>t.classList.toggle('active',(mode==='login'&&i===0)||(mode==='signup'&&i===1)));
   document.getElementById('auth-btn').textContent=mode==='login'?'Sign In →':'Create Account →';
   document.getElementById('auth-error').style.display='none';
+  document.getElementById('forgot-link').style.display=mode==='login'?'block':'none';
+}
+
+// ── Forgot / Reset Password ───────────────────────────────────
+function openForgot(){
+  document.getElementById('forgot-modal').classList.add('open');
+  document.getElementById('forgot-email').value=document.getElementById('auth-email').value||'';
+  document.getElementById('forgot-msg').style.display='none';
+}
+function closeForgot(){ document.getElementById('forgot-modal').classList.remove('open'); }
+async function submitForgot(){
+  const email=document.getElementById('forgot-email').value.trim();
+  const msg=document.getElementById('forgot-msg');
+  if(!email){msg.textContent='Please enter your email.';msg.className='modal-msg err';msg.style.display='block';return;}
+  msg.textContent='Sending…';msg.className='modal-msg ok';msg.style.display='block';
+  const res=await fetch('/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});
+  const data=await res.json();
+  if(res.ok){msg.textContent='✓ '+data.message;msg.className='modal-msg ok';}
+  else{msg.textContent='✗ '+data.error;msg.className='modal-msg err';}
+  msg.style.display='block';
+}
+
+let resetToken='';
+function openResetModal(token){
+  resetToken=token;
+  document.getElementById('reset-modal').classList.add('open');
+}
+async function submitReset(){
+  const pw=document.getElementById('reset-password').value;
+  const pw2=document.getElementById('reset-password2').value;
+  const msg=document.getElementById('reset-msg');
+  if(pw.length<6){msg.textContent='Password must be at least 6 characters.';msg.className='modal-msg err';msg.style.display='block';return;}
+  if(pw!==pw2){msg.textContent='Passwords do not match.';msg.className='modal-msg err';msg.style.display='block';return;}
+  const res=await fetch('/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:resetToken,password:pw})});
+  const data=await res.json();
+  if(res.ok){
+    msg.textContent='✓ '+data.message;msg.className='modal-msg ok';msg.style.display='block';
+    setTimeout(()=>{document.getElementById('reset-modal').classList.remove('open');history.replaceState(null,'','/');},2500);
+  } else {
+    msg.textContent='✗ '+data.error;msg.className='modal-msg err';msg.style.display='block';
+  }
 }
 async function submitAuth(){
   const email=document.getElementById('auth-email').value.trim();
@@ -1217,11 +1505,22 @@ async function showApp(email){
 // ── Currency ─────────────────────────────────────────────────────
 function updateCurrencyUI(){
   const c=getCurrInfo(userCurrency);
-  document.getElementById('curr-flag').textContent=c.sym;
-  document.getElementById('curr-code-badge').textContent=userCurrency;
+  // Update quick-select dropdown in dashboard header
+  const qs=document.getElementById('currency-quick-select');
+  if(qs){
+    qs.innerHTML=CURRENCIES.map(cur=>`<option value="${cur.code}" ${cur.code===userCurrency?'selected':''}>${cur.flag} ${cur.code}</option>`).join('');
+    qs.value=userCurrency;
+  }
   document.getElementById('add-sym').textContent=c.sym;
   // highlight settings grid
   document.querySelectorAll('.curr-opt').forEach(el=>el.classList.toggle('active',el.dataset.code===userCurrency));
+}
+async function quickChangeCurrency(code){
+  userCurrency=code;
+  updateCurrencyUI();
+  buildCurrencyPickers();
+  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:code})});
+  if(res.ok){ toast('Currency changed to '+code+'!'); loadDashboard(); }
 }
 
 function buildCurrencyGrid(){
@@ -1459,7 +1758,10 @@ async function submitTransaction(){
   document.getElementById('add-date').value=localToday();
   selectedCat='';
   setupCatPills();
-  toast('Entry added!');
+  toast('Entry added! ✓');
+  // Reload transactions and dashboard so stats update immediately
+  loadTransactions();
+  loadDashboard();
 }
 
 // ── AI Chat ───────────────────────────────────────────────────────
@@ -1488,7 +1790,7 @@ async function sendChat(){
   document.getElementById(typingId)?.remove();
   send.disabled=false;
   if(data.error==='no_key'){
-    appendMsg('ai','⚠️ Groq API key not set. Add GROQ_API_KEY to your Render environment variables.\n\nGet a free key at console.groq.com');
+    appendMsg('ai','⚠️ Please add your Anthropic API key in the Settings page or in the panel on the right to use AI features.');
   } else if(data.error){
     appendMsg('ai','⚠️ Error: '+data.error);
   } else {
@@ -1499,48 +1801,72 @@ function appendMsg(role,text){
   const messages=document.getElementById('chat-messages');
   const time=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
   const label=role==='user'?'You':'Vault AI';
-  const div=document.createElement('div');
-  div.className=`msg ${role}`;
-  const bubble=document.createElement('div');
-  bubble.className='msg-bubble';
-  // Safe: split on newlines, insert text nodes + <br> — no innerHTML, no XSS
-  text.split('\n').forEach((line,i)=>{
-    if(i>0) bubble.appendChild(document.createElement('br'));
-    bubble.appendChild(document.createTextNode(line));
-  });
-  const timeDiv=document.createElement('div');
-  timeDiv.className='msg-time';
-  timeDiv.textContent=`${label} · ${time}`;
-  div.appendChild(bubble);
-  div.appendChild(timeDiv);
-  messages.appendChild(div);
+  messages.innerHTML+=`<div class="msg ${role}">
+    <div class="msg-bubble">${text.replace(/\n/g,'<br/>')}</div>
+    <div class="msg-time">${label} · ${time}</div>
+  </div>`;
   messages.scrollTop=messages.scrollHeight;
 }
+async function saveAiKey(){
+  const key=document.getElementById('ai-key-input').value.trim();
+  if(!key){toast('Please enter a key','var(--red)');return;}
+  // FIX Bug 1: only send anthropic_key — don't accidentally overwrite currency
+  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anthropic_key:key})});
+  if(res.ok){toast('API key saved! AI is ready.');document.getElementById('ai-key-input').value='';}
+}
+async function saveAiKeyFromSettings(){
+  const key=document.getElementById('settings-ai-key').value.trim();
+  if(!key){toast('Please enter a key','var(--red)');return;}
+  // FIX Bug 1: only send anthropic_key — don't accidentally overwrite currency
+  const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({anthropic_key:key})});
+  if(res.ok){toast('API key saved!');document.getElementById('settings-ai-key').value='';}
+}
+
 // ── Boot ──────────────────────────────────────────────────────────
 (async()=>{
+  const urlParams=new URLSearchParams(window.location.search);
+  const resetTok=urlParams.get('token');
+  if(resetTok && window.location.pathname==='/reset-password'){
+    openResetModal(resetTok);
+    return;
+  }
+  // Check which features are enabled and hide Google button if not configured
+  try{
+    const cfg=await fetch('/api/config').then(r=>r.json());
+    if(!cfg.google_enabled){
+      const btn=document.querySelector('.auth-google-btn');
+      const divider=document.querySelector('.auth-divider');
+      if(btn) btn.style.display='none';
+      if(divider) divider.style.display='none';
+    }
+  }catch(e){}
   const res=await fetch('/api/me');
   const data=await res.json();
   if(data.logged_in){
-    userCurrency=data.currency||'USD';
-    const model=data.groq_model||'llama-3.3-70b-versatile';
-    const mb=document.getElementById('groq-model-badge');
-    const sb=document.getElementById('settings-groq-model');
-    if(mb) mb.textContent=model;
-    if(sb) sb.textContent=model;
-    const statusMsg=document.getElementById('ai-status-msg');
-    if(statusMsg){
-      if(data.groq_ready){
-        statusMsg.innerHTML='<span style="color:var(--green);">✓ Groq is configured and ready.</span><br/><span style="font-size:0.68rem;color:var(--ink3);">Free tier · ~14,400 requests/day</span>';
-      } else {
-        statusMsg.innerHTML='<span style="color:var(--amber);">⚠ GROQ_API_KEY not set.</span><br/><span style="font-size:0.68rem;color:var(--ink3);">Add it in Render → Environment → GROQ_API_KEY<br/>Get a free key at console.groq.com</span>';
-      }
-    }
+    userCurrency=data.currency||'INR';
     showApp(data.email);
+    if(urlParams.get('logged_in')==='1'){
+      history.replaceState(null,'','/');
+      toast('Signed in with Google! 🎉');
+    }
+  }
+  if(urlParams.get('error')){
+    document.getElementById('auth-error').textContent='Google sign-in failed: '+urlParams.get('error');
+    document.getElementById('auth-error').style.display='block';
+    history.replaceState(null,'','/');
   }
 })();
 </script>
 </body>
 </html>"""
+
+# ─── Auto-create tables on startup (works with both Gunicorn and direct run) ───
+# This runs when Gunicorn imports the module on Render, ensuring tables exist.
+if DATABASE_URL:
+    try:
+        init_db()
+    except Exception as e:
+        print(f"⚠️  Could not initialise DB on startup: {e}")
 
 if __name__ == "__main__":
     init_db()

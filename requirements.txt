@@ -2,4 +2,4 @@ flask
 gunicorn
 requests
 psycopg2-binary
-bcrypt
+authlib
