@@ -24,8 +24,8 @@ app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-pro
 # you want to test locally with PostgreSQL too.
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
-OLLAMA_URL   = os.environ.get("OLLAMA_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama3-8b-8192")
 
 def get_db():
     """Return a new psycopg2 connection. Render injects DATABASE_URL."""
@@ -146,7 +146,7 @@ def me():
     user = cur.fetchone()
     cur.close(); conn.close()
     has_key = bool(user["anthropic_key"]) if user else False
-    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key, "ollama_model": OLLAMA_MODEL})
+    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key, "groq_ready": bool(GROQ_API_KEY), "groq_model": GROQ_MODEL})
 
 # ─── Settings ─────────────────────────────────────────────────────────────────
 
@@ -282,7 +282,7 @@ def summary():
             cats[r["category"]] = cats.get(r["category"], 0) + to_display(r["amount"], r["currency"])
     return jsonify({"income": income, "expenses": expenses, "balance": income - expenses, "categories": cats, "display_currency": user_currency})
 
-# ─── AI Budget Advisor (Ollama) ───────────────────────────────────────────────
+# ─── AI Budget Advisor (Groq) ─────────────────────────────────────────────────
 
 @app.route("/api/ai-chat", methods=["POST"])
 @login_required
@@ -291,6 +291,9 @@ def ai_chat():
     user_message = data.get("message", "").strip()
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
+
+    if not GROQ_API_KEY:
+        return jsonify({"error": "no_key"}), 200
 
     conn = get_db()
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -324,24 +327,26 @@ Give practical, specific, actionable advice based on THEIR actual data. Be warm 
 
     try:
         response = req.post(
-            f"{OLLAMA_URL}/api/chat",
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json"
+            },
             json={
-                "model": OLLAMA_MODEL,
-                "stream": False,
+                "model": GROQ_MODEL,
+                "max_tokens": 500,
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": user_message}
                 ]
             },
-            timeout=60
+            timeout=30
         )
         if response.status_code != 200:
-            return jsonify({"error": f"Ollama returned {response.status_code}: {response.text[:200]}"}), 400
-        result = response.json()
-        reply = result["message"]["content"]
+            err = response.json().get("error", {}).get("message", "Groq API error")
+            return jsonify({"error": err}), 400
+        reply = response.json()["choices"][0]["message"]["content"]
         return jsonify({"reply": reply})
-    except req.exceptions.ConnectionError:
-        return jsonify({"error": "ollama_offline"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1011,7 +1016,7 @@ body::after{
     <div class="page" id="page-ai">
       <div class="page-header">
         <div class="page-title">AI Advisor</div>
-        <div class="page-sub">Powered by Ollama · Runs locally · Free</div>
+        <div class="page-sub">Powered by Groq · Free · Fast</div>
       </div>
       <div class="ai-layout">
         <div class="chat-card">
@@ -1042,11 +1047,10 @@ body::after{
             <button class="ai-tip-btn" onclick="askQuick('Am I on track with my spending this month?')">Am I on track this month?</button>
             <button class="ai-tip-btn" onclick="askQuick('Create a simple budget plan for next month based on my history.')">Build a budget plan</button>
           </div>
-          <div class="ai-key-card">
-            <div class="ai-key-title">🦙 Ollama — Local AI</div>
-            <p style="font-size:0.74rem;color:var(--green);margin-bottom:10px;line-height:1.5;">✓ Runs 100% on your machine — no API fees, no data sent online.</p>
-            <p style="font-size:0.72rem;color:var(--ink3);line-height:1.6;margin-bottom:8px;">Make sure Ollama is running:<br/><code style="font-size:0.7rem;background:var(--surface2);padding:2px 6px;border-radius:4px;">ollama serve</code></p>
-            <p style="font-size:0.72rem;color:var(--ink3);line-height:1.6;">Model: <code id="ollama-model-badge" style="font-size:0.7rem;background:var(--surface2);padding:2px 6px;border-radius:4px;">llama3</code><br/>Change with env var <code style="font-size:0.7rem;">OLLAMA_MODEL</code></p>
+          <div class="ai-key-card" id="ai-status-card">
+            <div class="ai-key-title">⚡ Groq AI</div>
+            <div id="ai-status-msg" style="font-size:0.74rem;line-height:1.6;">Checking status...</div>
+            <p style="font-size:0.68rem;color:var(--ink3);margin-top:10px;">Model: <code id="groq-model-badge" style="font-size:0.68rem;background:var(--surface2);padding:1px 5px;border-radius:4px;">llama3-8b-8192</code></p>
           </div>
         </div>
       </div>
@@ -1071,23 +1075,23 @@ body::after{
           <div class="rates-grid" id="rates-grid"><div style="color:var(--ink3);font-size:0.8rem;">Loading...</div></div>
         </div>
         <div class="settings-card" style="grid-column:1/-1;">
-          <div class="settings-section-title">🦙 AI Advisor — Ollama</div>
+          <div class="settings-section-title">⚡ AI Advisor — Groq</div>
           <div style="display:grid;grid-template-columns:1fr 1fr;gap:18px;">
             <div>
               <p style="font-size:0.78rem;color:var(--ink2);line-height:1.7;margin-bottom:10px;">
-                The AI advisor runs entirely on your own machine using <strong>Ollama</strong> — no API key, no fees, completely private.
+                The AI advisor uses <strong>Groq's free tier</strong> — up to 14,400 requests/day running Llama 3. No credit card needed.
               </p>
               <p style="font-size:0.72rem;color:var(--ink3);line-height:1.7;">
-                1. Install Ollama from <strong>ollama.com</strong><br/>
-                2. Run: <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">ollama pull llama3</code><br/>
-                3. Start: <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">ollama serve</code>
+                1. Sign up free at <strong>console.groq.com</strong><br/>
+                2. Create an API key<br/>
+                3. Add it as <code style="background:var(--surface2);padding:1px 6px;border-radius:4px;">GROQ_API_KEY</code> in your Render environment variables
               </p>
             </div>
             <div>
               <label style="font-size:0.68rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);display:block;margin-bottom:7px;">Active Model</label>
-              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-ollama-model">llama3</div>
-              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Set <code>OLLAMA_MODEL</code> env var to change model (e.g. mistral, llama3:8b)</p>
-              <p style="font-size:0.7rem;color:var(--ink3);margin-top:4px;">Set <code>OLLAMA_URL</code> to use a remote Ollama instance</p>
+              <div style="padding:11px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.85rem;color:var(--green);" id="settings-groq-model">llama3-8b-8192</div>
+              <p style="font-size:0.7rem;color:var(--ink3);margin-top:8px;">Other fast free models: <code>llama3-70b-8192</code>, <code>mixtral-8x7b-32768</code></p>
+              <p style="font-size:0.7rem;color:var(--ink3);margin-top:4px;">Set <code>GROQ_MODEL</code> env var in Render to change model.</p>
             </div>
           </div>
         </div>
@@ -1483,8 +1487,8 @@ async function sendChat(){
   const data=await res.json();
   document.getElementById(typingId)?.remove();
   send.disabled=false;
-  if(data.error==='ollama_offline'){
-    appendMsg('ai','⚠️ Ollama is not running. Start it with:\n\n  ollama serve\n\nMake sure you have pulled a model first:\n  ollama pull llama3');
+  if(data.error==='no_key'){
+    appendMsg('ai','⚠️ Groq API key not set. Add GROQ_API_KEY to your Render environment variables.\n\nGet a free key at console.groq.com');
   } else if(data.error){
     appendMsg('ai','⚠️ Error: '+data.error);
   } else {
@@ -1518,11 +1522,19 @@ function appendMsg(role,text){
   const data=await res.json();
   if(data.logged_in){
     userCurrency=data.currency||'USD';
-    const model=data.ollama_model||'llama3';
-    const mb=document.getElementById('ollama-model-badge');
-    const sb=document.getElementById('settings-ollama-model');
+    const model=data.groq_model||'llama3-8b-8192';
+    const mb=document.getElementById('groq-model-badge');
+    const sb=document.getElementById('settings-groq-model');
     if(mb) mb.textContent=model;
     if(sb) sb.textContent=model;
+    const statusMsg=document.getElementById('ai-status-msg');
+    if(statusMsg){
+      if(data.groq_ready){
+        statusMsg.innerHTML='<span style="color:var(--green);">✓ Groq is configured and ready.</span><br/><span style="font-size:0.68rem;color:var(--ink3);">Free tier · ~14,400 requests/day</span>';
+      } else {
+        statusMsg.innerHTML='<span style="color:var(--amber);">⚠ GROQ_API_KEY not set.</span><br/><span style="font-size:0.68rem;color:var(--ink3);">Add it in Render → Environment → GROQ_API_KEY<br/>Get a free key at console.groq.com</span>';
+      }
+    }
     showApp(data.email);
   }
 })();
