@@ -601,6 +601,13 @@ def health():
 
 # ── Frontend ───────────────────────────────────────────────────────────────────
 
+# Run migrations whenever the module is imported (covers Gunicorn on Render as
+# well as local `python money_app.py` — safe to call multiple times).
+try:
+    init_db()
+except Exception as _init_err:
+    logger.warning("init_db() skipped at import time (DATABASE_URL not set?): %s", _init_err)
+
 @app.route("/")
 def index():
     return FRONTEND
