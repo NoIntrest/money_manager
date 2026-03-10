@@ -148,6 +148,17 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS budgets (
+                id          SERIAL PRIMARY KEY,
+                user_id     INTEGER NOT NULL REFERENCES users(id),
+                month       TEXT NOT NULL,
+                category    TEXT NOT NULL,
+                goal_amount NUMERIC(14,2) NOT NULL,
+                currency    TEXT DEFAULT 'USD',
+                UNIQUE (user_id, month, category)
+            )
+        """)
 
 # ── Auth helpers ───────────────────────────────────────────────────────────────
 
@@ -475,6 +486,104 @@ def ai_chat():
     except Exception as e:
         logger.error("ai_chat groq error: %s", e)
         return jsonify({"error": "AI request failed. Please try again."}), 500
+
+# ── Budget ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/budget", methods=["GET"])
+@login_required
+def get_budget():
+    month = request.args.get("month", datetime.now().strftime("%Y-%m"))
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            cur.execute(
+                "SELECT category, goal_amount, currency FROM budgets "
+                "WHERE user_id=%s AND month=%s",
+                (session["user_id"], month)
+            )
+            rows = cur.fetchall()
+        return jsonify([{**dict(r), "goal_amount": float(r["goal_amount"])} for r in rows])
+    except Exception as e:
+        logger.error("get_budget error: %s", e)
+        return jsonify({"error": "Could not load budget goals."}), 500
+
+@app.route("/api/budget", methods=["POST"])
+@login_required
+def save_budget():
+    data     = request.json or {}
+    month    = data.get("month", datetime.now().strftime("%Y-%m"))
+    goals    = data.get("goals", [])   # [{category, goal_amount, currency}]
+    currency = data.get("currency", "USD")
+    if not isinstance(goals, list):
+        return jsonify({"error": "goals must be a list"}), 400
+    try:
+        with get_cursor() as (_, cur):
+            # Delete existing goals for this month, then re-insert
+            cur.execute(
+                "DELETE FROM budgets WHERE user_id=%s AND month=%s",
+                (session["user_id"], month)
+            )
+            for g in goals:
+                cat    = g.get("category", "").strip()
+                amount = g.get("goal_amount", 0)
+                try:
+                    amount = float(amount)
+                except (TypeError, ValueError):
+                    amount = 0
+                if cat and amount > 0:
+                    cur.execute(
+                        "INSERT INTO budgets (user_id, month, category, goal_amount, currency) "
+                        "VALUES (%s,%s,%s,%s,%s)",
+                        (session["user_id"], month, cat, amount, currency)
+                    )
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error("save_budget error: %s", e)
+        return jsonify({"error": "Could not save budget goals."}), 500
+
+@app.route("/api/budget/progress")
+@login_required
+def get_budget_progress():
+    month = request.args.get("month", datetime.now().strftime("%Y-%m"))
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            # User currency
+            cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
+            user = cur.fetchone()
+            # Goals
+            cur.execute(
+                "SELECT category, goal_amount, currency FROM budgets "
+                "WHERE user_id=%s AND month=%s",
+                (session["user_id"], month)
+            )
+            goals = {r["category"]: float(r["goal_amount"]) for r in cur.fetchall()}
+            # Actual spending per category for this month
+            cur.execute(
+                "SELECT category, SUM(amount) AS total FROM transactions "
+                "WHERE user_id=%s AND type='expense' AND date LIKE %s "
+                "GROUP BY category",
+                (session["user_id"], f"{month}%")
+            )
+            spent = {r["category"]: float(r["total"]) for r in cur.fetchall()}
+            # For savings: income - expenses
+            cur.execute(
+                "SELECT type, SUM(amount) AS total FROM transactions "
+                "WHERE user_id=%s AND date LIKE %s GROUP BY type",
+                (session["user_id"], f"{month}%")
+            )
+            totals = {r["type"]: float(r["total"]) for r in cur.fetchall()}
+        income   = totals.get("income", 0)
+        expenses = totals.get("expense", 0)
+        rows = []
+        for cat, goal in goals.items():
+            if cat == "Savings":
+                actual = income - expenses   # actual savings balance
+            else:
+                actual = spent.get(cat, 0)
+            rows.append({"category": cat, "goal": goal, "actual": round(actual, 2)})
+        return jsonify({"progress": rows, "display_currency": (user["currency"] or "USD") if user else "USD"})
+    except Exception as e:
+        logger.error("get_budget_progress error: %s", e)
+        return jsonify({"error": "Could not load progress."}), 500
 
 # ── Health ─────────────────────────────────────────────────────────────────────
 
@@ -932,6 +1041,45 @@ body::after{
 .empty-icon{font-size:2.4rem;opacity:0.3;margin-bottom:10px;}
 .empty-text{font-size:0.84rem;}
 
+/* ── Budget Page ─────────────────────────────────────────────── */
+.budget-tabs{display:flex;gap:0;border:1.5px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:28px;max-width:360px;}
+.budget-tab{flex:1;padding:10px 20px;border:none;cursor:pointer;font-family:'Outfit',sans-serif;font-size:0.78rem;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;background:transparent;color:var(--ink3);transition:all 0.18s;}
+.budget-tab.active{background:var(--orange-soft);color:var(--orange);}
+.budget-income-card{background:var(--surface);border:1.5px solid var(--border);border-radius:14px;padding:24px 28px;margin-bottom:20px;display:flex;align-items:center;gap:20px;flex-wrap:wrap;}
+.budget-income-label{font-size:0.68rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--ink3);margin-bottom:6px;}
+.budget-income-input{font-family:'JetBrains Mono',monospace;font-size:1.5rem;font-weight:500;width:200px;padding:10px 14px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;color:var(--ink);transition:border-color 0.18s;}
+.budget-income-input:focus{outline:none;border-color:var(--orange);box-shadow:0 0 0 3px rgba(240,112,32,0.1);}
+.budget-remaining{margin-left:auto;text-align:right;}
+.budget-remaining-label{font-size:0.65rem;letter-spacing:0.12em;text-transform:uppercase;color:var(--ink3);margin-bottom:4px;}
+.budget-remaining-amt{font-family:'JetBrains Mono',monospace;font-size:1.3rem;font-weight:600;}
+.budget-remaining-amt.ok{color:var(--green);}
+.budget-remaining-amt.over{color:var(--red);}
+.budget-cats-card{background:var(--surface);border:1.5px solid var(--border);border-radius:14px;overflow:hidden;margin-bottom:20px;}
+.budget-cat-row{display:flex;align-items:center;gap:16px;padding:14px 24px;border-bottom:1px solid var(--border);}
+.budget-cat-row:last-child{border-bottom:none;}
+.budget-cat-name{min-width:160px;font-size:0.86rem;font-weight:500;color:var(--ink);}
+.budget-cat-input{width:140px;padding:8px 12px;background:var(--surface2);border:1.5px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:0.9rem;color:var(--ink);transition:border-color 0.18s;}
+.budget-cat-input:focus{outline:none;border-color:var(--orange);}
+.budget-cat-pct{font-size:0.75rem;color:var(--ink3);font-family:'JetBrains Mono',monospace;min-width:50px;text-align:right;}
+.budget-slider{flex:1;-webkit-appearance:none;height:4px;border-radius:2px;background:var(--border);cursor:pointer;accent-color:var(--orange);}
+.budget-save-btn{padding:13px 32px;background:var(--grad-card);border:none;border-radius:10px;color:#fff;font-family:'Outfit',sans-serif;font-size:0.88rem;font-weight:700;letter-spacing:0.08em;text-transform:uppercase;cursor:pointer;transition:opacity 0.2s,transform 0.15s;margin-bottom:28px;}
+.budget-save-btn:hover{opacity:0.9;transform:translateY(-1px);}
+.progress-grid{display:flex;flex-direction:column;gap:14px;}
+.progress-row{background:var(--surface);border:1.5px solid var(--border);border-radius:12px;padding:18px 22px;}
+.progress-row-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+.progress-cat{font-size:0.88rem;font-weight:600;}
+.progress-nums{font-family:'JetBrains Mono',monospace;font-size:0.82rem;color:var(--ink2);}
+.progress-track{height:8px;background:var(--border);border-radius:4px;overflow:hidden;}
+.progress-fill{height:100%;border-radius:4px;transition:width 0.6s ease;}
+.progress-fill.ok{background:var(--green);}
+.progress-fill.warn{background:var(--amber);}
+.progress-fill.over{background:var(--red);}
+.progress-status{font-size:0.72rem;margin-top:6px;font-weight:500;}
+.progress-status.ok{color:var(--green);}
+.progress-status.warn{color:var(--amber);}
+.progress-status.over{color:var(--red);}
+.budget-special-badge{font-size:0.65rem;padding:2px 8px;border-radius:20px;background:var(--amber-soft);color:var(--amber);border:1px solid rgba(232,160,32,0.3);margin-left:8px;font-weight:600;letter-spacing:0.06em;text-transform:uppercase;vertical-align:middle;}
+
 @media(max-width:900px){
   .sidebar{width:200px;}
   .main{margin-left:200px;padding:28px;}
@@ -942,6 +1090,8 @@ body::after{
   .settings-grid{grid-template-columns:1fr;}
   .auth-split{grid-template-columns:1fr;}
   .auth-left{display:none;}
+  .budget-cat-row{flex-wrap:wrap;}
+  .budget-slider{width:100%;}
 }
 </style>
 </head>
@@ -988,6 +1138,7 @@ body::after{
       <div class="nav-item" onclick="showPage('add')"><span class="nav-icon">＋</span> Add Entry</div>
       <div class="nav-section-label">Tools</div>
       <div class="nav-item" onclick="showPage('ai')"><span class="nav-icon">🤖</span> AI Advisor</div>
+      <div class="nav-item" onclick="showPage('budget')"><span class="nav-icon">📋</span> Budget</div>
       <div class="nav-item" onclick="showPage('settings')"><span class="nav-icon">⚙</span> Settings</div>
     </nav>
     <div class="sidebar-bottom">
@@ -1177,6 +1328,49 @@ body::after{
             <div id="ai-status-msg" style="font-size:0.74rem;line-height:1.6;">Checking status...</div>
             <p style="font-size:0.68rem;color:var(--ink3);margin-top:10px;">Model: <code id="groq-model-badge" style="font-size:0.68rem;background:var(--surface2);padding:1px 5px;border-radius:4px;">llama-3.3-70b-versatile</code></p>
           </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Budget -->
+    <div class="page" id="page-budget">
+      <div class="page-header">
+        <div class="page-title">Budget</div>
+        <div class="page-sub">Plan &amp; track your monthly goals</div>
+      </div>
+      <div class="month-nav-row">
+        <button class="mnav" onclick="changeMonth(-1)">←</button>
+        <div class="mlabel" id="month-label-budget">—</div>
+        <button class="mnav" onclick="changeMonth(1)">→</button>
+      </div>
+      <div class="budget-tabs">
+        <button class="budget-tab active" id="btab-setup" onclick="switchBudgetTab('setup')">Set Goals</button>
+        <button class="budget-tab" id="btab-progress" onclick="switchBudgetTab('progress')">Progress</button>
+      </div>
+
+      <!-- Set Goals view -->
+      <div id="budget-setup-view">
+        <div class="budget-income-card">
+          <div>
+            <div class="budget-income-label">Monthly Income / Reference Budget</div>
+            <input class="budget-income-input" type="number" id="budget-income" placeholder="0.00" oninput="onBudgetIncomeChange()"/>
+          </div>
+          <div class="budget-remaining">
+            <div class="budget-remaining-label">Unallocated</div>
+            <div class="budget-remaining-amt ok" id="budget-remaining-amt">—</div>
+          </div>
+        </div>
+        <div class="budget-cats-card" id="budget-cats-card">
+          <!-- Rows injected by JS -->
+        </div>
+        <button class="budget-save-btn" onclick="saveBudget()">Save Budget Goals →</button>
+      </div>
+
+      <!-- Progress view -->
+      <div id="budget-progress-view" style="display:none;">
+        <div class="progress-grid" id="progress-grid"></div>
+        <div style="margin-top:20px;">
+          <button class="budget-save-btn" style="background:var(--surface);border:1.5px solid var(--border);color:var(--ink2);" onclick="switchBudgetTab('setup')">← Edit Goals</button>
         </div>
       </div>
     </div>
@@ -1452,11 +1646,12 @@ function showPage(name){
   document.querySelectorAll('.page').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n=>n.classList.remove('active'));
   document.getElementById('page-'+name).classList.add('active');
-  const map={dashboard:0,transactions:1,add:2,ai:3,settings:4};
+  const map={dashboard:0,transactions:1,add:2,ai:3,budget:4,settings:5};
   document.querySelectorAll('.nav-item')[map[name]]?.classList.add('active');
   if(name==='dashboard')loadDashboard();
   if(name==='transactions')loadTransactions();
   if(name==='settings'){fetchRates();buildRatesGrid();}
+  if(name==='budget'){loadBudgetPage();}
 }
 
 // ── Month ─────────────────────────────────────────────────────────
@@ -1469,6 +1664,7 @@ function changeMonth(dir){
   const active=document.querySelector('.page.active');
   if(active?.id==='page-dashboard') loadDashboard();
   else if(active?.id==='page-transactions') loadTransactions();
+  else if(active?.id==='page-budget') loadBudgetPage();
 }
 function updateMonthLabels(){
   const [y,m]=currentMonth.split('-').map(Number);
@@ -1477,6 +1673,8 @@ function updateMonthLabels(){
   document.getElementById('month-label-2').textContent=label;
   const el2=document.getElementById('chart-month-label');
   if(el2) el2.textContent=label;
+  const el3=document.getElementById('month-label-budget');
+  if(el3) el3.textContent=label;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────
@@ -1734,6 +1932,204 @@ function appendMsg(role,text){
   div.appendChild(timeDiv);
   messages.appendChild(div);
   messages.scrollTop=messages.scrollHeight;
+}
+
+// ── Budget ────────────────────────────────────────────────────────
+const BUDGET_CATS = [
+  '🍔 Food','🏠 Rent','🚗 Transport','🛍 Shopping','💊 Health',
+  '🎬 Entertainment','📱 Bills','✈️ Travel','📚 Education','🎁 Gifts','💼 Work','📦 Other',
+  'Savings'   // special: treated as income - expenses
+];
+
+let budgetGoals   = {};  // {category: amount}
+let budgetTab     = 'setup';
+
+function switchBudgetTab(tab){
+  budgetTab=tab;
+  document.getElementById('btab-setup').classList.toggle('active', tab==='setup');
+  document.getElementById('btab-progress').classList.toggle('active', tab==='progress');
+  document.getElementById('budget-setup-view').style.display   = tab==='setup'   ? '' : 'none';
+  document.getElementById('budget-progress-view').style.display = tab==='progress' ? '' : 'none';
+  if(tab==='progress') renderBudgetProgress();
+}
+
+async function loadBudgetPage(){
+  // Load saved goals for this month
+  try{
+    const res = await fetch('/api/budget?month='+currentMonth);
+    const rows = await res.json();
+    budgetGoals = {};
+    if(Array.isArray(rows)) rows.forEach(r=>{ budgetGoals[r.category]=r.goal_amount; });
+  }catch(e){ console.warn('budget load error',e); }
+  renderBudgetSetup();
+}
+
+function onBudgetIncomeChange(){
+  updateBudgetRemaining();
+}
+
+function updateBudgetRemaining(){
+  const income = parseFloat(document.getElementById('budget-income').value)||0;
+  const allocated = Object.values(budgetGoals).reduce((a,b)=>a+(b||0),0);
+  const remaining = income - allocated;
+  const el2 = document.getElementById('budget-remaining-amt');
+  const sym  = getCurrInfo(userCurrency).sym;
+  el2.textContent = (remaining<0?'-':'') + sym + Math.abs(remaining).toFixed(2);
+  el2.className   = 'budget-remaining-amt ' + (remaining<0?'over':'ok');
+}
+
+function renderBudgetSetup(){
+  const container = document.getElementById('budget-cats-card');
+  container.innerHTML='';
+  const sym = getCurrInfo(userCurrency).sym;
+
+  BUDGET_CATS.forEach(cat=>{
+    const row = el('div',{'class':'budget-cat-row'});
+
+    // Category label
+    const nameWrap = el('div',{'class':'budget-cat-name'});
+    nameWrap.appendChild(document.createTextNode(cat));
+    if(cat==='Savings'){
+      const badge = el('span',{'class':'budget-special-badge'},'auto');
+      nameWrap.appendChild(badge);
+    }
+    row.appendChild(nameWrap);
+
+    // Amount input
+    const input = el('input',{
+      'class':'budget-cat-input',
+      'type':'number',
+      'placeholder': sym+'0',
+      'value': budgetGoals[cat]!=null ? budgetGoals[cat].toFixed(2) : '',
+      'min':'0','step':'0.01'
+    });
+    input.addEventListener('input', ()=>{
+      const v = parseFloat(input.value)||0;
+      budgetGoals[cat] = v;
+      updateBudgetRemaining();
+      pctEl.textContent = getPctLabel(cat, income());
+    });
+    row.appendChild(input);
+
+    // Slider (0 to income or 50000)
+    const slider = el('input',{
+      'class':'budget-slider',
+      'type':'range',
+      'min':'0','step':'100',
+      'value': budgetGoals[cat]||0
+    });
+    // Sync slider max with income input dynamically
+    const syncMax = ()=>{ slider.max = Math.max(parseFloat(document.getElementById('budget-income').value)||50000, 50000); };
+    syncMax();
+    slider.addEventListener('input', ()=>{
+      const v = parseFloat(slider.value)||0;
+      input.value = v.toFixed(2);
+      budgetGoals[cat] = v;
+      updateBudgetRemaining();
+      pctEl.textContent = getPctLabel(cat, income());
+    });
+    input.addEventListener('input', ()=>{ slider.value = parseFloat(input.value)||0; });
+    document.getElementById('budget-income').addEventListener('input', syncMax);
+    row.appendChild(slider);
+
+    // Percentage label
+    const pctEl = el('div',{'class':'budget-cat-pct'}, getPctLabel(cat, income()));
+    row.appendChild(pctEl);
+
+    container.appendChild(row);
+  });
+
+  updateBudgetRemaining();
+
+  function income(){ return parseFloat(document.getElementById('budget-income').value)||0; }
+  function getPctLabel(cat, inc){
+    if(!inc) return '—';
+    const v = budgetGoals[cat]||0;
+    return Math.round((v/inc)*100)+'%';
+  }
+}
+
+async function saveBudget(){
+  const income = parseFloat(document.getElementById('budget-income').value)||0;
+  const goals  = BUDGET_CATS
+    .filter(cat=> (budgetGoals[cat]||0) > 0)
+    .map(cat=>({ category: cat, goal_amount: budgetGoals[cat], currency: userCurrency }));
+  if(goals.length===0){
+    toast('Set at least one goal amount first.', 'var(--amber)');
+    return;
+  }
+  try{
+    const res = await fetch('/api/budget',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ month: currentMonth, goals, currency: userCurrency })
+    });
+    const data = await res.json();
+    if(!res.ok){ toast(data.error||'Could not save.','var(--red)'); return; }
+    toast('Budget saved!');
+    switchBudgetTab('progress');
+  }catch(e){
+    toast('Save failed.','var(--red)');
+  }
+}
+
+async function renderBudgetProgress(){
+  const grid = document.getElementById('progress-grid');
+  grid.innerHTML='<div class="no-data">Loading...</div>';
+  try{
+    const res  = await fetch('/api/budget/progress?month='+currentMonth);
+    const data = await res.json();
+    const rows = data.progress||[];
+    grid.innerHTML='';
+    if(rows.length===0){
+      grid.innerHTML='<div class="empty"><div class="empty-icon">📋</div><div class="empty-text">No budget goals set yet.<br/>Switch to Set Goals to create your plan.</div></div>';
+      return;
+    }
+    const sym = getCurrInfo(userCurrency).sym;
+    rows.forEach(r=>{
+      const pct     = r.goal>0 ? Math.min((r.actual/r.goal)*100, 100) : 0;
+      const overPct = r.goal>0 ? (r.actual/r.goal)*100 : 0;
+      const isSavings = r.category==='Savings';
+      // For savings: green if actual >= goal, amber if within 20%, red if way under
+      let state;
+      if(isSavings){
+        state = r.actual>=r.goal ? 'ok' : (r.actual>=r.goal*0.75 ? 'warn' : 'over');
+      } else {
+        state = overPct<=80 ? 'ok' : overPct<=100 ? 'warn' : 'over';
+      }
+
+      const row = el('div',{'class':'progress-row'});
+      const header = el('div',{'class':'progress-row-header'});
+      const catEl  = el('div',{'class':'progress-cat'}, r.category);
+      if(isSavings){
+        const badge = el('span',{'class':'budget-special-badge'},'savings');
+        catEl.appendChild(badge);
+      }
+      const numsEl = el('div',{'class':'progress-nums'}, sym+r.actual.toFixed(2)+' / '+sym+r.goal.toFixed(2));
+      header.appendChild(catEl);
+      header.appendChild(numsEl);
+      row.appendChild(header);
+
+      const track = el('div',{'class':'progress-track'});
+      const fill  = el('div',{'class':'progress-fill '+state});
+      fill.style.width = pct.toFixed(1)+'%';
+      track.appendChild(fill);
+      row.appendChild(track);
+
+      let statusText;
+      if(isSavings){
+        const diff = r.actual - r.goal;
+        statusText = diff>=0 ? '✓ Goal met! '+sym+diff.toFixed(2)+' ahead' : sym+Math.abs(diff).toFixed(2)+' short of goal';
+      } else {
+        const rem = r.goal - r.actual;
+        statusText = rem>0 ? sym+rem.toFixed(2)+' remaining' : sym+Math.abs(rem).toFixed(2)+' over budget';
+      }
+      row.appendChild(el('div',{'class':'progress-status '+state}, statusText));
+      grid.appendChild(row);
+    });
+  }catch(e){
+    grid.innerHTML='<div class="empty"><div class="empty-text">Failed to load progress.</div></div>';
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────
