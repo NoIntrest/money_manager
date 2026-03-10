@@ -1,5 +1,4 @@
-flask
-gunicorn
-requests
-psycopg2-binary
-authlib
+streamlit>=1.35.0
+plotly>=5.22.0
+pandas>=2.0.0
+bcrypt>=4.0.0
