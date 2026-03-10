@@ -70,11 +70,21 @@ def init_db():
     cur.close()
     conn.close()
 
+import hashlib
+
 def hash_pw(pw):
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
 def check_pw(pw, hashed):
-    return bcrypt.checkpw(pw.encode(), hashed.encode())
+    """Support both bcrypt hashes and legacy SHA-256 hashes."""
+    # bcrypt hashes always start with $2b$ or $2a$
+    if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
+        try:
+            return bcrypt.checkpw(pw.encode(), hashed.encode())
+        except Exception:
+            return False
+    # Legacy SHA-256 fallback
+    return hashlib.sha256(pw.encode()).hexdigest() == hashed
 
 def login_required(f):
     @wraps(f)
@@ -124,9 +134,16 @@ def login():
     cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT * FROM users WHERE email=%s", (email,))
     user = cur.fetchone()
-    cur.close(); conn.close()
     if not user or not check_pw(password, user["password"]):
+        cur.close(); conn.close()
         return jsonify({"error": "Invalid email or password"}), 401
+    # Auto-upgrade legacy SHA-256 hash to bcrypt on first login
+    if not (user["password"].startswith("$2b$") or user["password"].startswith("$2a$")):
+        cur2 = conn.cursor()
+        cur2.execute("UPDATE users SET password=%s WHERE id=%s", (hash_pw(password), user["id"]))
+        conn.commit()
+        cur2.close()
+    cur.close(); conn.close()
     session["user_id"] = user["id"]
     session["email"] = user["email"]
     return jsonify({"success": True, "email": user["email"], "currency": user["currency"] or "USD"})
