@@ -1,1 +1,1 @@
-web: gunicorn money_app:app
+web: gunicorn money_app:app --workers 1

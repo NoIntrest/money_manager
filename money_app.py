@@ -1,89 +1,166 @@
 #!/usr/bin/env python3
 """
-💰 Vault — Money Manager (v3)
-Features: Multi-currency, Live rates, AI Budget Advisor
-Database: PostgreSQL (persistent on Render)
-Run locally: pip install flask requests psycopg2-binary && python money_app.py
-On Render:  Set DATABASE_URL env var from your Render PostgreSQL instance
-Open: http://localhost:5000
+💰 Vault — Money Manager (v4 — hardened)
+Fixes applied:
+  1.  Secret key raises error in production if not set
+  2.  Rate limiting on auth routes (Flask-Limiter, in-memory)
+  3.  Internal errors are logged server-side; generic messages sent to client
+  4.  anthropic_key column removed (deprecated, migrated away)
+  5.  Connection pooling via ThreadedConnectionPool (max 3 for Render free tier)
+  6.  Procfile sets --workers 1 so in-memory rates cache is safe
+  7.  debug=False (reads DEBUG env var instead)
+  8.  All imports at the top
+  9.  try/finally via context manager — no leaked connections
+  10. Shared get_cursor() helper removes repeated DB boilerplate
+  11. XSS: user data never injected via innerHTML in the frontend
+  12. Loading skeletons on dashboard & transactions
+Run locally: pip install flask flask-limiter requests psycopg2-binary bcrypt
+On Render:   set DATABASE_URL + SECRET_KEY env vars
 """
 
-from flask import Flask, request, jsonify, session
-import bcrypt, os, json, requests as req
+# ── Imports ────────────────────────────────────────────────────────────────────
+import os
+import json
+import logging
+import hashlib
+from contextlib import contextmanager
 from datetime import datetime, date
 from functools import wraps
+
+import bcrypt
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
+import requests as req
+from flask import Flask, request, jsonify, session
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
+# ── App & logging ──────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "vault-local-dev-key-change-in-prod")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# ─── Database ─────────────────────────────────────────────────────────────────
-# Reads DATABASE_URL from environment (set by Render automatically when you
-# attach a PostgreSQL instance). Falls back to a local SQLite-style URL if
-# you want to test locally with PostgreSQL too.
+# ── Secret key ─────────────────────────────────────────────────────────────────
+# Render sets the RENDER env var automatically on all its services.
+# If we're on Render and SECRET_KEY isn't set, we refuse to start rather than
+# silently using a guessable key.
+_SECRET = os.environ.get("SECRET_KEY")
+if not _SECRET:
+    if os.environ.get("RENDER"):
+        raise RuntimeError(
+            "SECRET_KEY environment variable must be set in production. "
+            "Add it in Render → Environment."
+        )
+    _SECRET = "vault-local-dev-key-DO-NOT-USE-IN-PROD"
+    logger.warning("WARNING: using insecure dev secret key — set SECRET_KEY in production")
 
+app.secret_key = _SECRET
+
+# ── Rate limiter (in-memory — works fine with 1 Gunicorn worker) ───────────────
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],          # no global limit; apply per-route
+    storage_uri="memory://",    # no Redis needed
+)
+
+# ── Config ─────────────────────────────────────────────────────────────────────
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL   = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+DEBUG        = os.environ.get("DEBUG", "false").lower() == "true"
 
-def get_db():
-    """Return a new psycopg2 connection. Render injects DATABASE_URL."""
-    if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL environment variable is not set. "
-            "Add a PostgreSQL database in Render and link it to this service."
-        )
-    # Render sometimes gives 'postgres://' but psycopg2 needs 'postgresql://'
-    url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-    conn = psycopg2.connect(url)
-    return conn
+# ── Connection pool ────────────────────────────────────────────────────────────
+# Render free PostgreSQL allows ~5 concurrent connections.
+# We cap at 3 to leave headroom for migrations / psql sessions.
+_pool: ThreadedConnectionPool | None = None
+
+def get_pool() -> ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        if not DATABASE_URL:
+            raise RuntimeError(
+                "DATABASE_URL is not set. "
+                "Add a PostgreSQL database in Render and link it to this service."
+            )
+        url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+        _pool = ThreadedConnectionPool(1, 3, dsn=url)
+    return _pool
+
+@contextmanager
+def get_cursor(dict_cursor: bool = False):
+    """
+    Context manager that borrows a connection from the pool, yields
+    (conn, cursor), commits on success, rolls back on error, and always
+    returns the connection to the pool.
+
+    Usage:
+        with get_cursor(dict_cursor=True) as (conn, cur):
+            cur.execute(...)
+    """
+    pool = get_pool()
+    conn = pool.getconn()
+    try:
+        factory = psycopg2.extras.RealDictCursor if dict_cursor else None
+        cur = conn.cursor(cursor_factory=factory) if factory else conn.cursor()
+        try:
+            yield conn, cur
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            cur.close()
+    finally:
+        pool.putconn(conn)
+
+# ── Database init ──────────────────────────────────────────────────────────────
 
 def init_db():
-    """Create tables if they don't exist. Safe to run on every startup."""
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id SERIAL PRIMARY KEY,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            currency TEXT DEFAULT 'USD',
-            anthropic_key TEXT DEFAULT '',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS transactions (
-            id SERIAL PRIMARY KEY,
-            user_id INTEGER NOT NULL REFERENCES users(id),
-            type TEXT NOT NULL,
-            amount NUMERIC(14,2) NOT NULL,
-            currency TEXT DEFAULT 'USD',
-            category TEXT,
-            note TEXT,
-            date TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    """Create / migrate tables. Safe to run on every startup."""
+    with get_cursor() as (conn, cur):
+        # Users — note: anthropic_key column is dropped if it still exists
+        # from an older deployment
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id         SERIAL PRIMARY KEY,
+                email      TEXT UNIQUE NOT NULL,
+                password   TEXT NOT NULL,
+                currency   TEXT DEFAULT 'USD',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Migration: drop the unused anthropic_key column if present
+        cur.execute("""
+            ALTER TABLE users DROP COLUMN IF EXISTS anthropic_key
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS transactions (
+                id         SERIAL PRIMARY KEY,
+                user_id    INTEGER NOT NULL REFERENCES users(id),
+                type       TEXT NOT NULL,
+                amount     NUMERIC(14,2) NOT NULL,
+                currency   TEXT DEFAULT 'USD',
+                category   TEXT,
+                note       TEXT,
+                date       TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
-import hashlib
+# ── Auth helpers ───────────────────────────────────────────────────────────────
 
-def hash_pw(pw):
+def hash_pw(pw: str) -> str:
     return bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
 
-def check_pw(pw, hashed):
-    """Support both bcrypt hashes and legacy SHA-256 hashes."""
-    # bcrypt hashes always start with $2b$ or $2a$
+def check_pw(pw: str, hashed: str) -> bool:
+    """Supports both bcrypt and legacy SHA-256 hashes."""
     if hashed.startswith("$2b$") or hashed.startswith("$2a$"):
         try:
             return bcrypt.checkpw(pw.encode(), hashed.encode())
         except Exception:
             return False
-    # Legacy SHA-256 fallback
     return hashlib.sha256(pw.encode()).hexdigest() == hashed
 
 def login_required(f):
@@ -94,59 +171,61 @@ def login_required(f):
         return f(*args, **kwargs)
     return decorated
 
-# ─── Auth ─────────────────────────────────────────────────────────────────────
+# ── Auth routes ────────────────────────────────────────────────────────────────
 
 @app.route("/api/signup", methods=["POST"])
+@limiter.limit("10 per minute")   # brute-force protection
 def signup():
-    data = request.json
-    email = data.get("email", "").strip().lower()
+    data     = request.json or {}
+    email    = data.get("email", "").strip().lower()
     password = data.get("password", "")
     if not email or not password:
         return jsonify({"error": "Email and password required"}), 400
     if len(password) < 6:
         return jsonify({"error": "Password must be at least 6 characters"}), 400
-    conn = get_db()
     try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("INSERT INTO users (email, password) VALUES (%s, %s)", (email, hash_pw(password)))
-        conn.commit()
-        cur.execute("SELECT * FROM users WHERE email=%s", (email,))
-        user = cur.fetchone()
+        with get_cursor(dict_cursor=True) as (conn, cur):
+            try:
+                cur.execute(
+                    "INSERT INTO users (email, password) VALUES (%s, %s)",
+                    (email, hash_pw(password))
+                )
+            except psycopg2.errors.UniqueViolation:
+                conn.rollback()
+                return jsonify({"error": "Email already registered"}), 409
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+            user = cur.fetchone()
         session["user_id"] = user["id"]
-        session["email"] = email
-        cur.close(); conn.close()
+        session["email"]   = email
         return jsonify({"success": True, "email": email, "currency": "USD"})
-    except psycopg2.errors.UniqueViolation:
-        conn.rollback()
-        conn.close()
-        return jsonify({"error": "Email already registered"}), 409
     except Exception as e:
-        conn.rollback()
-        conn.close()
-        return jsonify({"error": str(e)}), 500
+        logger.error("signup error: %s", e)
+        return jsonify({"error": "Could not create account. Please try again."}), 500
 
 @app.route("/api/login", methods=["POST"])
+@limiter.limit("15 per minute")   # brute-force protection
 def login():
-    data = request.json
-    email = data.get("email", "").strip().lower()
+    data     = request.json or {}
+    email    = data.get("email", "").strip().lower()
     password = data.get("password", "")
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM users WHERE email=%s", (email,))
-    user = cur.fetchone()
-    if not user or not check_pw(password, user["password"]):
-        cur.close(); conn.close()
-        return jsonify({"error": "Invalid email or password"}), 401
-    # Auto-upgrade legacy SHA-256 hash to bcrypt on first login
-    if not (user["password"].startswith("$2b$") or user["password"].startswith("$2a$")):
-        cur2 = conn.cursor()
-        cur2.execute("UPDATE users SET password=%s WHERE id=%s", (hash_pw(password), user["id"]))
-        conn.commit()
-        cur2.close()
-    cur.close(); conn.close()
-    session["user_id"] = user["id"]
-    session["email"] = user["email"]
-    return jsonify({"success": True, "email": user["email"], "currency": user["currency"] or "USD"})
+    try:
+        with get_cursor(dict_cursor=True) as (conn, cur):
+            cur.execute("SELECT * FROM users WHERE email=%s", (email,))
+            user = cur.fetchone()
+            if not user or not check_pw(password, user["password"]):
+                return jsonify({"error": "Invalid email or password"}), 401
+            # Upgrade legacy SHA-256 hash to bcrypt on first login
+            if not (user["password"].startswith("$2b$") or user["password"].startswith("$2a$")):
+                cur.execute(
+                    "UPDATE users SET password=%s WHERE id=%s",
+                    (hash_pw(password), user["id"])
+                )
+        session["user_id"] = user["id"]
+        session["email"]   = user["email"]
+        return jsonify({"success": True, "email": user["email"], "currency": user["currency"] or "USD"})
+    except Exception as e:
+        logger.error("login error: %s", e)
+        return jsonify({"error": "Login failed. Please try again."}), 500
 
 @app.route("/api/logout", methods=["POST"])
 def logout():
@@ -157,37 +236,45 @@ def logout():
 def me():
     if "user_id" not in session:
         return jsonify({"logged_in": False})
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT email, currency, anthropic_key FROM users WHERE id=%s", (session["user_id"],))
-    user = cur.fetchone()
-    cur.close(); conn.close()
-    has_key = bool(user["anthropic_key"]) if user else False
-    return jsonify({"logged_in": True, "email": user["email"], "currency": user["currency"] or "USD", "has_ai_key": has_key, "groq_ready": bool(GROQ_API_KEY), "groq_model": GROQ_MODEL})
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            cur.execute(
+                "SELECT email, currency FROM users WHERE id=%s",
+                (session["user_id"],)
+            )
+            user = cur.fetchone()
+        return jsonify({
+            "logged_in":   True,
+            "email":       user["email"],
+            "currency":    user["currency"] or "USD",
+            "groq_ready":  bool(GROQ_API_KEY),
+            "groq_model":  GROQ_MODEL,
+        })
+    except Exception as e:
+        logger.error("me error: %s", e)
+        return jsonify({"error": "Could not load user data."}), 500
 
-# ─── Settings ─────────────────────────────────────────────────────────────────
+# ── Settings ───────────────────────────────────────────────────────────────────
 
 @app.route("/api/settings", methods=["POST"])
 @login_required
 def update_settings():
-    data = request.json
-    conn = get_db()
-    cur = conn.cursor()
-    # Only update fields that were actually sent — never wipe a field
-    if "currency" in data and "anthropic_key" in data:
-        cur.execute("UPDATE users SET currency=%s, anthropic_key=%s WHERE id=%s",
-                   (data["currency"], data["anthropic_key"], session["user_id"]))
-    elif "currency" in data:
-        cur.execute("UPDATE users SET currency=%s WHERE id=%s",
-                   (data["currency"], session["user_id"]))
-    elif "anthropic_key" in data:
-        cur.execute("UPDATE users SET anthropic_key=%s WHERE id=%s",
-                   (data["anthropic_key"], session["user_id"]))
-    conn.commit()
-    cur.close(); conn.close()
-    return jsonify({"success": True})
+    data = request.json or {}
+    if "currency" not in data:
+        return jsonify({"error": "No settings provided"}), 400
+    try:
+        with get_cursor() as (_, cur):
+            cur.execute(
+                "UPDATE users SET currency=%s WHERE id=%s",
+                (data["currency"], session["user_id"])
+            )
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error("settings error: %s", e)
+        return jsonify({"error": "Could not save settings."}), 500
 
-# ─── Live Currency Rates ───────────────────────────────────────────────────────
+# ── Live Currency Rates ────────────────────────────────────────────────────────
+# Safe to keep in-memory: Procfile forces --workers 1 so there's only one process.
 
 _rates_cache = {"ts": 0, "data": {}}
 
@@ -195,96 +282,107 @@ _rates_cache = {"ts": 0, "data": {}}
 def get_rates():
     import time
     now = time.time()
-    # Cache for 1 hour
     if now - _rates_cache["ts"] < 3600 and _rates_cache["data"]:
         return jsonify(_rates_cache["data"])
     try:
         r = req.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5)
-        data = r.json()
-        rates = data.get("rates", {})
-        _rates_cache["ts"] = now
+        rates = r.json().get("rates", {})
+        _rates_cache["ts"]   = now
         _rates_cache["data"] = rates
         return jsonify(rates)
     except Exception as e:
-        # Fallback static rates if API is down
-        fallback = {"USD":1,"EUR":0.92,"GBP":0.79,"INR":83.1,"JPY":149.5,
-                    "CAD":1.36,"AUD":1.53,"CHF":0.88,"CNY":7.24,"SGD":1.34,
-                    "AED":3.67,"MXN":17.2,"BRL":4.97,"KRW":1325,"THB":35.1}
+        logger.warning("Exchange rate fetch failed: %s", e)
+        fallback = {
+            "USD":1,"EUR":0.92,"GBP":0.79,"INR":83.1,"JPY":149.5,
+            "CAD":1.36,"AUD":1.53,"CHF":0.88,"CNY":7.24,"SGD":1.34,
+            "AED":3.67,"MXN":17.2,"BRL":4.97,"KRW":1325,"THB":35.1,
+        }
         return jsonify(fallback)
 
-# ─── Transactions ──────────────────────────────────────────────────────────────
+# ── Transactions ───────────────────────────────────────────────────────────────
 
 @app.route("/api/transactions", methods=["GET"])
 @login_required
 def get_transactions():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "SELECT * FROM transactions WHERE user_id=%s AND date LIKE %s ORDER BY date DESC, id DESC",
-        (session["user_id"], f"{month}%")
-    )
-    rows = cur.fetchall()
-    cur.close(); conn.close()
-    return jsonify([{**dict(r), 'amount': float(r['amount'])} for r in rows])
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            cur.execute(
+                "SELECT * FROM transactions WHERE user_id=%s AND date LIKE %s ORDER BY date DESC, id DESC",
+                (session["user_id"], f"{month}%")
+            )
+            rows = cur.fetchall()
+        return jsonify([{**dict(r), "amount": float(r["amount"])} for r in rows])
+    except Exception as e:
+        logger.error("get_transactions error: %s", e)
+        return jsonify({"error": "Could not load transactions."}), 500
 
 @app.route("/api/transactions", methods=["POST"])
 @login_required
 def add_transaction():
-    data = request.json
-    tx_type = data.get("type")
-    amount = data.get("amount")
-    currency = data.get("currency", "USD")
-    category = data.get("category", "Other")
-    note = data.get("note", "")
-    tx_date = data.get("date", str(date.today()))
+    data      = request.json or {}
+    tx_type   = data.get("type")
+    amount    = data.get("amount")
+    currency  = data.get("currency", "USD")
+    category  = data.get("category", "Other")
+    note      = data.get("note", "")
+    tx_date   = data.get("date", str(date.today()))
     if tx_type not in ("income", "expense"):
         return jsonify({"error": "Type must be income or expense"}), 400
     try:
         amount = float(amount)
-        if amount <= 0: raise ValueError()
+        if amount <= 0:
+            raise ValueError()
     except (TypeError, ValueError):
         return jsonify({"error": "Amount must be a positive number"}), 400
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO transactions (user_id, type, amount, currency, category, note, date) VALUES (%s,%s,%s,%s,%s,%s,%s)",
-        (session["user_id"], tx_type, amount, currency, category, note, tx_date)
-    )
-    conn.commit()
-    cur.close(); conn.close()
-    return jsonify({"success": True})
+    try:
+        with get_cursor() as (_, cur):
+            cur.execute(
+                "INSERT INTO transactions (user_id, type, amount, currency, category, note, date) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (session["user_id"], tx_type, amount, currency, category, note, tx_date)
+            )
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error("add_transaction error: %s", e)
+        return jsonify({"error": "Could not save transaction."}), 500
 
 @app.route("/api/transactions/<int:tx_id>", methods=["DELETE"])
 @login_required
 def delete_transaction(tx_id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM transactions WHERE id=%s AND user_id=%s", (tx_id, session["user_id"]))
-    conn.commit()
-    cur.close(); conn.close()
-    return jsonify({"success": True})
+    try:
+        with get_cursor() as (_, cur):
+            cur.execute(
+                "DELETE FROM transactions WHERE id=%s AND user_id=%s",
+                (tx_id, session["user_id"])
+            )
+        return jsonify({"success": True})
+    except Exception as e:
+        logger.error("delete_transaction error: %s", e)
+        return jsonify({"error": "Could not delete transaction."}), 500
 
 @app.route("/api/summary")
 @login_required
 def summary():
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
-    user = cur.fetchone()
-    user_currency = (user["currency"] or "USD") if user else "USD"
-    cur.execute(
-        "SELECT type, category, amount, currency FROM transactions WHERE user_id=%s AND date LIKE %s",
-        (session["user_id"], f"{month}%")
-    )
-    rows = cur.fetchall()
-    cur.close(); conn.close()
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
+            user = cur.fetchone()
+            cur.execute(
+                "SELECT type, category, amount, currency FROM transactions "
+                "WHERE user_id=%s AND date LIKE %s",
+                (session["user_id"], f"{month}%")
+            )
+            rows = cur.fetchall()
+    except Exception as e:
+        logger.error("summary error: %s", e)
+        return jsonify({"error": "Could not load summary."}), 500
 
+    user_currency = (user["currency"] or "USD") if user else "USD"
     rates = _rates_cache.get("data", {})
 
     def to_display(amount, from_cur):
-        """Convert amount from from_cur to user_currency via USD as base."""
         from_cur = from_cur or "USD"
         if not rates or from_cur == user_currency:
             return float(amount)
@@ -297,67 +395,77 @@ def summary():
     for r in rows:
         if r["type"] == "expense":
             cats[r["category"]] = cats.get(r["category"], 0) + to_display(r["amount"], r["currency"])
-    return jsonify({"income": income, "expenses": expenses, "balance": income - expenses, "categories": cats, "display_currency": user_currency})
 
-# ─── AI Budget Advisor (Groq) ─────────────────────────────────────────────────
+    return jsonify({
+        "income":           income,
+        "expenses":         expenses,
+        "balance":          income - expenses,
+        "categories":       cats,
+        "display_currency": user_currency,
+    })
+
+# ── AI Budget Advisor (Groq) ───────────────────────────────────────────────────
 
 @app.route("/api/ai-chat", methods=["POST"])
 @login_required
+@limiter.limit("30 per minute")
 def ai_chat():
-    data = request.json
+    data         = request.json or {}
     user_message = data.get("message", "").strip()
     if not user_message:
         return jsonify({"error": "No message provided"}), 400
-
     if not GROQ_API_KEY:
         return jsonify({"error": "no_key"}), 200
 
-    conn = get_db()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
-    user = cur.fetchone()
-    cur.execute(
-        "SELECT type, amount, currency, category, note, date FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
-        (session["user_id"],)
-    )
-    txs = cur.fetchall()
-    cur.close(); conn.close()
+    try:
+        with get_cursor(dict_cursor=True) as (_, cur):
+            cur.execute("SELECT currency FROM users WHERE id=%s", (session["user_id"],))
+            user = cur.fetchone()
+            cur.execute(
+                "SELECT type, amount, currency, category, note, date "
+                "FROM transactions WHERE user_id=%s ORDER BY date DESC LIMIT 50",
+                (session["user_id"],)
+            )
+            txs = cur.fetchall()
+    except Exception as e:
+        logger.error("ai_chat DB error: %s", e)
+        return jsonify({"error": "Could not load your data."}), 500
 
     currency = (user["currency"] or "USD") if user else "USD"
-
     tx_summary = "\n".join([
-        f"- {t['date']} | {t['type'].upper()} | {t['currency'] or currency}{float(t['amount']):.2f} | {t['category']} | {t['note'] or ''}"
+        f"- {t['date']} | {t['type'].upper()} | {t['currency'] or currency}{float(t['amount']):.2f} "
+        f"| {t['category']} | {t['note'] or ''}"
         for t in txs
     ]) or "No transactions yet."
 
     income_total  = sum(float(t["amount"]) for t in txs if t["type"] == "income")
     expense_total = sum(float(t["amount"]) for t in txs if t["type"] == "expense")
 
-    system_prompt = f"""You are Vault AI, a friendly and insightful personal finance advisor built into the Vault money management app.
-The user's preferred currency is {currency}.
-Here is their recent transaction history (last 50 entries):
-{tx_summary}
-
-Summary: Total income = {currency}{income_total:.2f}, Total expenses = {currency}{expense_total:.2f}, Balance = {currency}{income_total - expense_total:.2f}
-
-Give practical, specific, actionable advice based on THEIR actual data. Be warm but direct. Keep responses concise (3-5 sentences max unless asked for detail). Use {currency} for all amounts."""
+    system_prompt = (
+        f"You are Vault AI, a friendly and insightful personal finance advisor.\n"
+        f"The user's preferred currency is {currency}.\n"
+        f"Recent transactions (last 50):\n{tx_summary}\n\n"
+        f"Summary: income={currency}{income_total:.2f}, "
+        f"expenses={currency}{expense_total:.2f}, "
+        f"balance={currency}{income_total - expense_total:.2f}\n\n"
+        f"Give practical, specific, actionable advice based on THEIR data. "
+        f"Be warm but direct. Keep responses concise (3-5 sentences) unless asked for detail. "
+        f"Use {currency} for all amounts."
+    )
 
     try:
         response = req.post(
             "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "Content-Type": "application/json"
-            },
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
             json={
-                "model": GROQ_MODEL,
+                "model":      GROQ_MODEL,
                 "max_tokens": 500,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": user_message}
-                ]
+                    {"role": "user",   "content": user_message},
+                ],
             },
-            timeout=30
+            timeout=30,
         )
         if response.status_code != 200:
             err = response.json().get("error", {}).get("message", "Groq API error")
@@ -365,28 +473,30 @@ Give practical, specific, actionable advice based on THEIR actual data. Be warm 
         reply = response.json()["choices"][0]["message"]["content"]
         return jsonify({"reply": reply})
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        logger.error("ai_chat groq error: %s", e)
+        return jsonify({"error": "AI request failed. Please try again."}), 500
 
-# ─── Frontend ─────────────────────────────────────────────────────────────────
+# ── Health ─────────────────────────────────────────────────────────────────────
 
 @app.route("/api/health")
 def health():
-    """Quick check — is the DB reachable?"""
-    db_url = os.environ.get("DATABASE_URL", "")
-    if not db_url:
+    if not DATABASE_URL:
         return jsonify({"status": "error", "reason": "DATABASE_URL not set"}), 500
     try:
-        conn = get_db()
-        conn.close()
+        with get_cursor() as (_, cur):
+            cur.execute("SELECT 1")
         return jsonify({"status": "ok", "db": "connected"})
     except Exception as e:
-        return jsonify({"status": "error", "reason": str(e)}), 500
+        logger.error("health check failed: %s", e)
+        return jsonify({"status": "error", "reason": "DB unreachable"}), 500
+
+# ── Frontend ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
     return FRONTEND
 
-# ─── HTML ─────────────────────────────────────────────────────────────────────
+# ── HTML ───────────────────────────────────────────────────────────────────────
 
 FRONTEND = r"""<!DOCTYPE html>
 <html lang="en">
@@ -551,6 +661,18 @@ body::after{
 .page-header{margin-bottom:32px;}
 .page-title{font-family:'Fraunces',serif;font-size:2rem;font-weight:700;letter-spacing:-0.02em;margin-bottom:4px;}
 .page-sub{font-size:0.78rem;color:var(--ink3);letter-spacing:0.1em;text-transform:uppercase;}
+
+/* ── Skeleton loading ────────────────────────────────────────── */
+.skeleton{
+  background:linear-gradient(90deg,var(--surface2) 25%,var(--border) 50%,var(--surface2) 75%);
+  background-size:200% 100%;
+  animation:shimmer 1.4s infinite;
+  border-radius:8px;
+}
+@keyframes shimmer{from{background-position:200% 0;}to{background-position:-200% 0;}}
+.skel-amount{height:2.2rem;width:140px;margin-top:6px;}
+.skel-text{height:0.9rem;width:100%;}
+.skel-text.short{width:60%;}
 
 /* ── Month Nav ───────────────────────────────────────────────── */
 .month-nav-row{display:flex;align-items:center;gap:12px;margin-bottom:28px;}
@@ -761,18 +883,6 @@ body::after{
 .ai-tip-btn:hover{border-color:var(--orange);color:var(--orange);background:var(--orange-soft);}
 .ai-key-card{background:var(--amber-soft);border:1.5px solid rgba(232,160,32,0.3);border-radius:16px;padding:22px;}
 .ai-key-title{font-size:0.7rem;letter-spacing:0.14em;text-transform:uppercase;color:var(--amber);margin-bottom:10px;}
-.ai-key-input{
-  width:100%;padding:10px 14px;margin-bottom:10px;
-  background:#fff;border:1.5px solid rgba(232,160,32,0.3);border-radius:8px;
-  font-family:'JetBrains Mono',monospace;font-size:0.78rem;color:var(--ink);
-}
-.ai-key-input:focus{outline:none;border-color:var(--amber);}
-.ai-key-btn{
-  width:100%;padding:9px;background:var(--amber);border:none;border-radius:8px;
-  color:#fff;font-family:'Outfit',sans-serif;font-size:0.78rem;font-weight:700;cursor:pointer;
-  transition:opacity 0.2s;
-}
-.ai-key-btn:hover{opacity:0.85;}
 
 /* ── Settings Page ───────────────────────────────────────────── */
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:800px;}
@@ -940,7 +1050,6 @@ body::after{
           </div>
         </div>
         <div style="display:flex;flex-direction:column;gap:16px;">
-          <!-- Live converter -->
           <div class="convert-widget">
             <div class="convert-title">🌍 Live Converter</div>
             <div class="convert-row">
@@ -952,7 +1061,6 @@ body::after{
             <div class="convert-result" id="conv-result">—</div>
             <div class="convert-rate" id="conv-rate"></div>
           </div>
-          <!-- Recent -->
           <div class="widget">
             <div class="widget-title">Recent Activity</div>
             <div id="recent-list"><div class="no-data">No transactions yet</div></div>
@@ -1123,18 +1231,12 @@ body::after{
 <script>
 // ── State ────────────────────────────────────────────────────────
 const CURRENCIES = [
-  {code:'USD',sym:'$',flag:'🇺🇸'},
-  {code:'GBP',sym:'£',flag:'🇬🇧'},
-  {code:'EUR',sym:'€',flag:'🇪🇺'},
-  {code:'INR',sym:'₹',flag:'🇮🇳'},
-  {code:'JPY',sym:'¥',flag:'🇯🇵'},
-  {code:'CAD',sym:'C$',flag:'🇨🇦'},
-  {code:'AUD',sym:'A$',flag:'🇦🇺'},
-  {code:'AED',sym:'د.إ',flag:'🇦🇪'},
-  {code:'SGD',sym:'S$',flag:'🇸🇬'},
-  {code:'CHF',sym:'Fr',flag:'🇨🇭'},
-  {code:'CNY',sym:'¥',flag:'🇨🇳'},
-  {code:'MXN',sym:'$',flag:'🇲🇽'},
+  {code:'USD',sym:'$',flag:'🇺🇸'},{code:'GBP',sym:'£',flag:'🇬🇧'},
+  {code:'EUR',sym:'€',flag:'🇪🇺'},{code:'INR',sym:'₹',flag:'🇮🇳'},
+  {code:'JPY',sym:'¥',flag:'🇯🇵'},{code:'CAD',sym:'C$',flag:'🇨🇦'},
+  {code:'AUD',sym:'A$',flag:'🇦🇺'},{code:'AED',sym:'د.إ',flag:'🇦🇪'},
+  {code:'SGD',sym:'S$',flag:'🇸🇬'},{code:'CHF',sym:'Fr',flag:'🇨🇭'},
+  {code:'CNY',sym:'¥',flag:'🇨🇳'},{code:'MXN',sym:'$',flag:'🇲🇽'},
 ];
 
 const CATS = {
@@ -1143,13 +1245,13 @@ const CATS = {
 };
 
 let userCurrency = 'USD';
-let currentType = 'income';
-let selectedCat = '';
-let allTx = [];
-let txFilter = 'all';
-let liveRates = {};
-let pieChart = null;
-let authMode = 'login';
+let currentType  = 'income';
+let selectedCat  = '';
+let allTx        = [];
+let txFilter     = 'all';
+let liveRates    = {};
+let pieChart     = null;
+let authMode     = 'login';
 
 const _now = new Date();
 let currentMonth = _now.getFullYear() + '-' + String(_now.getMonth()+1).padStart(2,'0');
@@ -1170,6 +1272,29 @@ function toast(msg,color='var(--green)'){
   setTimeout(()=>t.style.display='none',2500);
 }
 
+// Safe DOM helpers — no innerHTML with user data
+function el(tag, attrs={}, ...children){
+  const e=document.createElement(tag);
+  for(const [k,v] of Object.entries(attrs)){
+    if(k==='class') e.className=v;
+    else if(k.startsWith('on')) e.addEventListener(k.slice(2),v);
+    else e.setAttribute(k,v);
+  }
+  for(const child of children){
+    if(child==null) continue;
+    e.appendChild(typeof child==='string' ? document.createTextNode(child) : child);
+  }
+  return e;
+}
+
+// Skeleton loader helper
+function skelRow(){
+  const row=document.createElement('div');
+  row.style.cssText='padding:14px 0;border-bottom:1px solid var(--border);';
+  row.innerHTML='<div class="skeleton skel-text short" style="margin-bottom:8px;"></div><div class="skeleton skel-text" style="width:40%;"></div>';
+  return row;
+}
+
 // ── Auth ─────────────────────────────────────────────────────────
 function switchTab(mode){
   authMode=mode;
@@ -1180,11 +1305,10 @@ function switchTab(mode){
 async function submitAuth(){
   const email=document.getElementById('auth-email').value.trim();
   const password=document.getElementById('auth-password').value;
-  const err=document.getElementById('auth-error');
-  err.style.display='none';
-  // Basic validation
-  if(!email){err.textContent='Please enter your email.';err.style.display='block';return;}
-  if(!password||password.length<6){err.textContent='Password must be at least 6 characters.';err.style.display='block';return;}
+  const errEl=document.getElementById('auth-error');
+  errEl.style.display='none';
+  if(!email){errEl.textContent='Please enter your email.';errEl.style.display='block';return;}
+  if(!password||password.length<6){errEl.textContent='Password must be at least 6 characters.';errEl.style.display='block';return;}
   const btn=document.getElementById('auth-btn');
   btn.textContent='Please wait...';btn.disabled=true;
   try{
@@ -1192,16 +1316,15 @@ async function submitAuth(){
     const res=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,password})});
     let data;
     try{ data=await res.json(); }
-    catch(e){ 
-      // Server returned non-JSON (e.g. 500 HTML error page)
-      err.textContent='Server error — the database may not be connected yet. Check Render environment variables (DATABASE_URL).';
-      err.style.display='block';return;
+    catch(e){
+      errEl.textContent='Server error — the database may not be connected yet. Check Render environment variables (DATABASE_URL).';
+      errEl.style.display='block';return;
     }
-    if(!res.ok){err.textContent=data.error||'Something went wrong.';err.style.display='block';return;}
+    if(!res.ok){errEl.textContent=data.error||'Something went wrong.';errEl.style.display='block';return;}
     userCurrency=data.currency||'USD';
     showApp(data.email);
   }catch(e){
-    err.textContent='Network error: '+e.message;err.style.display='block';
+    errEl.textContent='Network error: '+e.message;errEl.style.display='block';
   }finally{
     btn.textContent=authMode==='login'?'Sign In →':'Create Account →';btn.disabled=false;
   }
@@ -1237,32 +1360,39 @@ function updateCurrencyUI(){
   document.getElementById('curr-flag').textContent=c.sym;
   document.getElementById('curr-code-badge').textContent=userCurrency;
   document.getElementById('add-sym').textContent=c.sym;
-  // highlight settings grid
   document.querySelectorAll('.curr-opt').forEach(el=>el.classList.toggle('active',el.dataset.code===userCurrency));
 }
-
 function buildCurrencyGrid(){
   const grid=document.getElementById('curr-grid');
-  grid.innerHTML=CURRENCIES.map(c=>`
-    <div class="curr-opt${c.code===userCurrency?' active':''}" data-code="${c.code}" onclick="selectCurrency('${c.code}',this)">
-      <span class="curr-sym">${c.flag}</span>${c.code}
-    </div>`).join('');
+  grid.innerHTML='';
+  CURRENCIES.forEach(c=>{
+    const div=el('div',{'class':'curr-opt'+(c.code===userCurrency?' active':''),'data-code':c.code,'onclick':()=>selectCurrency(c.code,div)});
+    const sym=el('span',{'class':'curr-sym'},c.flag);
+    div.appendChild(sym);
+    div.appendChild(document.createTextNode(c.code));
+    grid.appendChild(div);
+  });
 }
-function selectCurrency(code,el){
+function selectCurrency(code,divEl){
   userCurrency=code;
   document.querySelectorAll('.curr-opt').forEach(e=>e.classList.remove('active'));
-  el.classList.add('active');
+  divEl.classList.add('active');
 }
 async function saveCurrency(){
-  // FIX Bug 1: only send currency — don't wipe anthropic_key
   const res=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({currency:userCurrency})});
   if(res.ok){ updateCurrencyUI(); buildCurrencyPickers(); toast('Currency saved!'); loadDashboard(); }
 }
-
 function buildCurrencyPickers(){
-  const opts=CURRENCIES.map(c=>`<option value="${c.code}" ${c.code===userCurrency?'selected':''}>${c.flag} ${c.code}</option>`).join('');
   const addCur=document.getElementById('add-currency');
-  if(addCur) addCur.innerHTML=opts;
+  if(!addCur) return;
+  addCur.innerHTML='';
+  CURRENCIES.forEach(c=>{
+    const opt=document.createElement('option');
+    opt.value=c.code;
+    opt.textContent=c.flag+' '+c.code;
+    if(c.code===userCurrency) opt.selected=true;
+    addCur.appendChild(opt);
+  });
 }
 
 // ── Live Rates ────────────────────────────────────────────────────
@@ -1275,19 +1405,32 @@ async function fetchRates(){
 }
 function buildRatesGrid(){
   const grid=document.getElementById('rates-grid');
-  if(!grid)return;
+  if(!grid) return;
+  grid.innerHTML='';
   const show=['EUR','GBP','INR','JPY','CAD','AUD','AED','SGD','CHF','CNY'];
-  grid.innerHTML=show.map(code=>{
+  show.forEach(code=>{
     const r=liveRates[code];
-    return `<div class="rate-row"><span class="rate-code">${code}</span><span class="rate-val">${r?r.toFixed(4):'—'}</span></div>`;
-  }).join('');
+    const row=el('div',{'class':'rate-row'},
+      el('span',{'class':'rate-code'},code),
+      el('span',{'class':'rate-val'},r?r.toFixed(4):'—')
+    );
+    grid.appendChild(row);
+  });
 }
 function buildConverterSelects(){
-  const opts=CURRENCIES.map(c=>`<option value="${c.code}">${c.flag} ${c.code}</option>`).join('');
-  document.getElementById('conv-from').innerHTML=opts;
-  document.getElementById('conv-to').innerHTML=opts;
-  document.getElementById('conv-from').value=userCurrency;
-  document.getElementById('conv-to').value=userCurrency==='USD'?'EUR':'USD';
+  const makeOpts=sel=>{
+    sel.innerHTML='';
+    CURRENCIES.forEach(c=>{
+      const opt=document.createElement('option');
+      opt.value=c.code; opt.textContent=c.flag+' '+c.code;
+      sel.appendChild(opt);
+    });
+  };
+  const from=document.getElementById('conv-from');
+  const to=document.getElementById('conv-to');
+  makeOpts(from); makeOpts(to);
+  from.value=userCurrency;
+  to.value=userCurrency==='USD'?'EUR':'USD';
   doConvert();
 }
 function doConvert(){
@@ -1299,9 +1442,9 @@ function doConvert(){
   const result=amtUSD*liveRates[to];
   const toSym=getCurrInfo(to).sym;
   const fromSym=getCurrInfo(from).sym;
-  document.getElementById('conv-result').textContent=`${toSym}${result.toFixed(2)}`;
+  document.getElementById('conv-result').textContent=toSym+result.toFixed(2);
   const rate=(liveRates[to]/liveRates[from]);
-  document.getElementById('conv-rate').textContent=`1 ${from} = ${toSym}${rate.toFixed(4)} ${to} · Live rate`;
+  document.getElementById('conv-rate').textContent='1 '+from+' = '+toSym+rate.toFixed(4)+' '+to+' · Live rate';
 }
 
 // ── Navigation ────────────────────────────────────────────────────
@@ -1320,112 +1463,164 @@ function showPage(name){
 function changeMonth(dir){
   let [y,m]=currentMonth.split('-').map(Number);
   m+=dir;
-  if(m>12){m=1;y++;}
-  if(m<1){m=12;y--;}
+  if(m>12){m=1;y++;} if(m<1){m=12;y--;}
   currentMonth=y+'-'+String(m).padStart(2,'0');
   updateMonthLabels();
   const active=document.querySelector('.page.active');
-  if(active?.id==='page-dashboard')loadDashboard();
-  else if(active?.id==='page-transactions')loadTransactions();
+  if(active?.id==='page-dashboard') loadDashboard();
+  else if(active?.id==='page-transactions') loadTransactions();
 }
 function updateMonthLabels(){
   const [y,m]=currentMonth.split('-').map(Number);
   const label=new Date(y,m-1,1).toLocaleDateString('en-GB',{month:'long',year:'numeric'});
   document.getElementById('month-label').textContent=label;
   document.getElementById('month-label-2').textContent=label;
-  const el=document.getElementById('chart-month-label');
-  if(el)el.textContent=label;
+  const el2=document.getElementById('chart-month-label');
+  if(el2) el2.textContent=label;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────
-async function loadDashboard(){
-  const [sumRes,txRes]=await Promise.all([
-    fetch(`/api/summary?month=${currentMonth}`),
-    fetch(`/api/transactions?month=${currentMonth}`)
-  ]);
-  const sum=await sumRes.json();
-  const txs=await txRes.json();
-
-  const sym=getCurrInfo(userCurrency).sym;
-  const bal=sum.balance;
-  document.getElementById('dash-balance').textContent=(bal<0?'-':'')+sym+Math.abs(bal).toFixed(2);
-  document.getElementById('dash-balance').style.color=bal>=0?'#6ee7a0':'#fca89a';
-  document.getElementById('dash-income').textContent=sym+sum.income.toFixed(2);
-  document.getElementById('dash-expense').textContent=sym+sum.expenses.toFixed(2);
-  document.getElementById('dash-income-mini').textContent='↑ '+sym+sum.income.toFixed(2)+' income';
-  document.getElementById('dash-expense-mini').textContent='↓ '+sym+sum.expenses.toFixed(2)+' spent';
-
-  const savings = sum.income>0 ? Math.round(((sum.income-sum.expenses)/sum.income)*100) : 0;
-  document.getElementById('dash-savings').textContent=savings+'%';
-
-  // Pie chart
-  const canvas=document.getElementById('pie-chart');
-  const noData=document.getElementById('pie-no-data');
-  const cats=sum.categories;
-  if(pieChart){pieChart.destroy();pieChart=null;}
-  if(Object.keys(cats).length===0){canvas.style.display='none';noData.style.display='block';}
-  else{
-    canvas.style.display='block';noData.style.display='none';
-    const colors=['#e03c2a','#f07020','#e8a020','#2a9a50','#f5c842','#e87040','#c03020','#d4600a','#b8901a','#1a7a40'];
-    pieChart=new Chart(canvas,{
-      type:'doughnut',
-      data:{labels:Object.keys(cats),datasets:[{data:Object.values(cats),backgroundColor:colors,borderWidth:0,hoverOffset:6}]},
-      options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>`${sym}${ctx.parsed.toFixed(2)}`}}},cutout:'62%'}
-    });
-  }
-
-  // Recent list
+function showDashboardSkeleton(){
+  // Show skeleton in cards while loading
+  ['dash-balance','dash-income','dash-expense','dash-savings'].forEach(id=>{
+    const e=document.getElementById(id);
+    if(e){ e.innerHTML='<div class="skeleton skel-amount"></div>'; }
+  });
+  document.getElementById('dash-income-mini').textContent='—';
+  document.getElementById('dash-expense-mini').textContent='—';
   const list=document.getElementById('recent-list');
-  if(txs.length===0){list.innerHTML='<div class="no-data">No transactions yet</div>';return;}
-  list.innerHTML=txs.slice(0,5).map(t=>{
-    const txSym=getCurrInfo(t.currency||userCurrency).sym;
-    return `<div class="tx-mini">
-      <div class="tx-mini-left">
-        <div class="tx-mini-cat">${t.category||'—'}</div>
-        ${t.note?`<div class="tx-mini-note">${t.note}</div>`:''}
-      </div>
-      <div class="tx-mini-right">
-        <div class="tx-mini-amt ${t.type}">${t.type==='income'?'+':'-'}${txSym}${t.amount.toFixed(2)}</div>
-        <div class="tx-mini-date">${t.date}</div>
-      </div>
-    </div>`;
-  }).join('');
+  list.innerHTML='';
+  for(let i=0;i<4;i++) list.appendChild(skelRow());
+}
+
+async function loadDashboard(){
+  showDashboardSkeleton();
+  try{
+    const [sumRes,txRes]=await Promise.all([
+      fetch('/api/summary?month='+currentMonth),
+      fetch('/api/transactions?month='+currentMonth)
+    ]);
+    const sum=await sumRes.json();
+    const txs=await txRes.json();
+
+    const sym=getCurrInfo(userCurrency).sym;
+    const bal=sum.balance;
+
+    const balEl=document.getElementById('dash-balance');
+    balEl.textContent=(bal<0?'-':'')+sym+Math.abs(bal).toFixed(2);
+    balEl.style.color=bal>=0?'#6ee7a0':'#fca89a';
+
+    document.getElementById('dash-income').textContent=sym+sum.income.toFixed(2);
+    document.getElementById('dash-expense').textContent=sym+sum.expenses.toFixed(2);
+    document.getElementById('dash-income-mini').textContent='↑ '+sym+sum.income.toFixed(2)+' income';
+    document.getElementById('dash-expense-mini').textContent='↓ '+sym+sum.expenses.toFixed(2)+' spent';
+
+    const savings=sum.income>0?Math.round(((sum.income-sum.expenses)/sum.income)*100):0;
+    document.getElementById('dash-savings').textContent=savings+'%';
+
+    // Pie chart
+    const canvas=document.getElementById('pie-chart');
+    const noData=document.getElementById('pie-no-data');
+    const cats=sum.categories;
+    if(pieChart){pieChart.destroy();pieChart=null;}
+    if(Object.keys(cats).length===0){
+      canvas.style.display='none';noData.style.display='block';
+    } else {
+      canvas.style.display='block';noData.style.display='none';
+      const colors=['#e03c2a','#f07020','#e8a020','#2a9a50','#f5c842','#e87040','#c03020','#d4600a','#b8901a','#1a7a40'];
+      pieChart=new Chart(canvas,{
+        type:'doughnut',
+        data:{labels:Object.keys(cats),datasets:[{data:Object.values(cats),backgroundColor:colors,borderWidth:0,hoverOffset:6}]},
+        options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:ctx=>sym+ctx.parsed.toFixed(2)}}},cutout:'62%'}
+      });
+    }
+
+    // Recent list — built with DOM API (no innerHTML with user data)
+    const list=document.getElementById('recent-list');
+    list.innerHTML='';
+    if(txs.length===0){
+      list.innerHTML='<div class="no-data">No transactions yet</div>';
+      return;
+    }
+    txs.slice(0,5).forEach(t=>{
+      const txSym=getCurrInfo(t.currency||userCurrency).sym;
+      const row=el('div',{'class':'tx-mini'});
+      const left=el('div',{'class':'tx-mini-left'});
+      left.appendChild(el('div',{'class':'tx-mini-cat'},t.category||'—'));
+      if(t.note) left.appendChild(el('div',{'class':'tx-mini-note'},t.note));
+      const right=el('div',{'class':'tx-mini-right'});
+      const amt=el('div',{'class':'tx-mini-amt '+t.type},(t.type==='income'?'+':'-')+txSym+t.amount.toFixed(2));
+      const dateEl=el('div',{'class':'tx-mini-date'},t.date);
+      right.appendChild(amt); right.appendChild(dateEl);
+      row.appendChild(left); row.appendChild(right);
+      list.appendChild(row);
+    });
+  }catch(e){
+    console.error('Dashboard load error',e);
+  }
 }
 
 // ── Transactions ──────────────────────────────────────────────────
-function setFilter(f,el){
+function setFilter(f,elBtn){
   txFilter=f;
   document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
-  el.classList.add('active');
+  elBtn.classList.add('active');
   renderTx();
 }
+
+function showTransactionsSkeleton(){
+  const list=document.getElementById('tx-list');
+  list.innerHTML='';
+  for(let i=0;i<6;i++){
+    const row=document.createElement('div');
+    row.style.cssText='background:var(--surface);border:1.5px solid var(--border);border-radius:12px;padding:20px;margin-bottom:8px;';
+    row.innerHTML='<div class="skeleton skel-text short" style="margin-bottom:10px;"></div><div class="skeleton skel-text" style="width:30%;"></div>';
+    list.appendChild(row);
+  }
+}
+
 async function loadTransactions(){
-  const res=await fetch(`/api/transactions?month=${currentMonth}`);
-  allTx=await res.json();
-  renderTx();
+  showTransactionsSkeleton();
+  try{
+    const res=await fetch('/api/transactions?month='+currentMonth);
+    allTx=await res.json();
+    renderTx();
+  }catch(e){
+    console.error('Transaction load error',e);
+    document.getElementById('tx-list').innerHTML='<div class="empty"><div class="empty-text">Failed to load transactions.</div></div>';
+  }
 }
+
+// Build transaction rows with DOM API — no innerHTML with user-supplied data
 function renderTx(){
   const filtered=txFilter==='all'?allTx:allTx.filter(t=>t.type===txFilter);
   const list=document.getElementById('tx-list');
-  if(filtered.length===0){list.innerHTML='<div class="empty"><div class="empty-icon">◈</div><div class="empty-text">No transactions found</div></div>';return;}
-  list.innerHTML=filtered.map(t=>{
+  list.innerHTML='';
+  if(filtered.length===0){
+    const empty=el('div',{'class':'empty'},el('div',{'class':'empty-icon'},'◈'),el('div',{'class':'empty-text'},'No transactions found'));
+    list.appendChild(empty);
+    return;
+  }
+  filtered.forEach(t=>{
     const txSym=getCurrInfo(t.currency||userCurrency).sym;
-    return `<div class="tx-row">
-      <div class="tx-dot ${t.type}"></div>
-      <div class="tx-info">
-        <div class="tx-cat">${t.category||'—'}</div>
-        ${t.note?`<div class="tx-note">${t.note}</div>`:''}
-      </div>
-      <div class="tx-date">${t.date}</div>
-      <div class="tx-cur">${t.currency||userCurrency}</div>
-      <div class="tx-amount ${t.type}">${t.type==='income'?'+':'-'}${txSym}${t.amount.toFixed(2)}</div>
-      <button class="tx-del" onclick="deleteTx(${t.id})" title="Delete">✕</button>
-    </div>`;
-  }).join('');
+    const row=el('div',{'class':'tx-row'});
+    row.appendChild(el('div',{'class':'tx-dot '+t.type}));
+    const info=el('div',{'class':'tx-info'});
+    info.appendChild(el('div',{'class':'tx-cat'},t.category||'—'));
+    if(t.note) info.appendChild(el('div',{'class':'tx-note'},t.note));
+    row.appendChild(info);
+    row.appendChild(el('div',{'class':'tx-date'},t.date));
+    row.appendChild(el('div',{'class':'tx-cur'},t.currency||userCurrency));
+    row.appendChild(el('div',{'class':'tx-amount '+t.type},(t.type==='income'?'+':'-')+txSym+t.amount.toFixed(2)));
+    const del=el('button',{'class':'tx-del','title':'Delete','onclick':()=>deleteTx(t.id)},'✕');
+    row.appendChild(del);
+    list.appendChild(row);
+  });
 }
+
 async function deleteTx(id){
-  if(!confirm('Delete this transaction?'))return;
-  await fetch(`/api/transactions/${id}`,{method:'DELETE'});
+  if(!confirm('Delete this transaction?')) return;
+  await fetch('/api/transactions/'+id,{method:'DELETE'});
   allTx=allTx.filter(t=>t.id!==id);
   renderTx();
   loadDashboard();
@@ -1434,9 +1629,8 @@ async function deleteTx(id){
 // ── Add Entry ─────────────────────────────────────────────────────
 function setType(type){
   currentType=type;
-  document.getElementById('btn-income').className=`type-btn income${type==='income'?' active':''}`;
-  document.getElementById('btn-expense').className=`type-btn expense${type==='expense'?' active':''}`;
-  // FIX Bug 2: only show category pills for expenses — income category is fixed
+  document.getElementById('btn-income').className='type-btn income'+(type==='income'?' active':'');
+  document.getElementById('btn-expense').className='type-btn expense'+(type==='expense'?' active':'');
   document.getElementById('cat-section').style.display=type==='expense'?'block':'none';
   selectedCat='';
   setupCatPills();
@@ -1444,33 +1638,36 @@ function setType(type){
 function setupCatPills(){
   const cats=CATS[currentType]||[];
   const container=document.getElementById('cat-pills');
-  if(!container)return;
-  container.innerHTML=cats.map(c=>`<div class="cat-pill${c===selectedCat?' active':''}" onclick="selectCat(this,'${c}')">${c}</div>`).join('');
+  if(!container) return;
+  container.innerHTML='';
+  cats.forEach(c=>{
+    const pill=el('div',{'class':'cat-pill'+(c===selectedCat?' active':''),'onclick':()=>selectCat(pill,c)},c);
+    container.appendChild(pill);
+  });
 }
-function selectCat(el,cat){
+function selectCat(pillEl,cat){
   selectedCat=cat;
   document.querySelectorAll('.cat-pill').forEach(p=>p.classList.remove('active'));
-  el.classList.add('active');
+  pillEl.classList.add('active');
 }
 async function submitTransaction(){
   const amount=document.getElementById('add-amount').value;
   const currency=document.getElementById('add-currency').value||userCurrency;
   const txDate=document.getElementById('add-date').value;
   const note=document.getElementById('add-note').value.trim();
-  const err=document.getElementById('add-error');
-  err.style.display='none';
-  // FIX Bug 3: client-side validation before hitting the server
+  const errEl=document.getElementById('add-error');
+  errEl.style.display='none';
   if(!amount||isNaN(parseFloat(amount))||parseFloat(amount)<=0){
-    err.textContent='Please enter a valid amount greater than 0.';err.style.display='block';return;
+    errEl.textContent='Please enter a valid amount greater than 0.';errEl.style.display='block';return;
   }
-  if(!txDate){err.textContent='Please select a date.';err.style.display='block';return;}
+  if(!txDate){errEl.textContent='Please select a date.';errEl.style.display='block';return;}
   const category=currentType==='expense'?selectedCat||'Other':'Income';
   const res=await fetch('/api/transactions',{
     method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({type:currentType,amount:parseFloat(amount),currency,category,note,date:txDate})
   });
   const data=await res.json();
-  if(!res.ok){err.textContent=data.error;err.style.display='block';return;}
+  if(!res.ok){errEl.textContent=data.error;errEl.style.display='block';return;}
   document.getElementById('add-amount').value='';
   document.getElementById('add-note').value='';
   document.getElementById('add-date').value=localToday();
@@ -1487,52 +1684,58 @@ function askQuick(msg){
 async function sendChat(){
   const input=document.getElementById('chat-input');
   const msg=input.value.trim();
-  if(!msg)return;
+  if(!msg) return;
   input.value='';
   appendMsg('user',msg);
   const send=document.getElementById('chat-send');
   send.disabled=true;
-  // typing indicator
   const typingId='typing-'+Date.now();
   const messages=document.getElementById('chat-messages');
-  messages.innerHTML+=`<div class="msg ai" id="${typingId}"><div class="msg-bubble"><div class="typing"><span></span><span></span><span></span></div></div></div>`;
+  const typingDiv=el('div',{'class':'msg ai','id':typingId},
+    el('div',{'class':'msg-bubble'},
+      el('div',{'class':'typing'},el('span'),el('span'),el('span'))
+    )
+  );
+  messages.appendChild(typingDiv);
   messages.scrollTop=messages.scrollHeight;
-  const res=await fetch('/api/ai-chat',{
-    method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({message:msg})
-  });
-  const data=await res.json();
-  document.getElementById(typingId)?.remove();
-  send.disabled=false;
-  if(data.error==='no_key'){
-    appendMsg('ai','⚠️ Groq API key not set. Add GROQ_API_KEY to your Render environment variables.\n\nGet a free key at console.groq.com');
-  } else if(data.error){
-    appendMsg('ai','⚠️ Error: '+data.error);
-  } else {
-    appendMsg('ai',data.reply);
+  try{
+    const res=await fetch('/api/ai-chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+    const data=await res.json();
+    document.getElementById(typingId)?.remove();
+    send.disabled=false;
+    if(data.error==='no_key'){
+      appendMsg('ai','⚠️ Groq API key not set. Add GROQ_API_KEY to your Render environment variables.\n\nGet a free key at console.groq.com');
+    } else if(data.error){
+      appendMsg('ai','⚠️ Error: '+data.error);
+    } else {
+      appendMsg('ai',data.reply);
+    }
+  }catch(e){
+    document.getElementById(typingId)?.remove();
+    send.disabled=false;
+    appendMsg('ai','⚠️ Network error. Please try again.');
   }
 }
+
+// Safe message renderer — uses createTextNode, never innerHTML
 function appendMsg(role,text){
   const messages=document.getElementById('chat-messages');
   const time=new Date().toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});
   const label=role==='user'?'You':'Vault AI';
-  const div=document.createElement('div');
-  div.className=`msg ${role}`;
   const bubble=document.createElement('div');
   bubble.className='msg-bubble';
-  // Safe: split on newlines, insert text nodes + <br> — no innerHTML, no XSS
   text.split('\n').forEach((line,i)=>{
     if(i>0) bubble.appendChild(document.createElement('br'));
     bubble.appendChild(document.createTextNode(line));
   });
-  const timeDiv=document.createElement('div');
-  timeDiv.className='msg-time';
-  timeDiv.textContent=`${label} · ${time}`;
+  const timeDiv=el('div',{'class':'msg-time'},label+' · '+time);
+  const div=el('div',{'class':'msg '+role});
   div.appendChild(bubble);
   div.appendChild(timeDiv);
   messages.appendChild(div);
   messages.scrollTop=messages.scrollHeight;
 }
+
 // ── Boot ──────────────────────────────────────────────────────────
 (async()=>{
   const res=await fetch('/api/me');
@@ -1561,11 +1764,10 @@ function appendMsg(role,text){
 
 if __name__ == "__main__":
     init_db()
-    print("\n💰 Vault — Money Manager v2")
+    print("\n💰 Vault — Money Manager v4")
     print("═" * 44)
     print("  Open:  http://localhost:5000")
     print("  Stop:  Ctrl+C")
     print("  DB:    PostgreSQL (persistent)")
-    print("  New:   Multi-currency + AI Advisor")
     print("═" * 44 + "\n")
-    app.run(debug=True, port=5000)
+    app.run(debug=DEBUG, port=5000)

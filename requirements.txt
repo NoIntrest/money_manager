@@ -1,5 +1,6 @@
 flask
 gunicorn
+flask-limiter
 requests
 psycopg2-binary
 bcrypt
